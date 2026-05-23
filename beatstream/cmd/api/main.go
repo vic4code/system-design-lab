@@ -61,12 +61,16 @@ func main() {
 	})
 
 	// v1 API
+	artists := handler.NewArtists(pool)
 	tracks := handler.NewTracks(pool, store)
 	playlists := handler.NewPlaylists(pool)
 	search := handler.NewSearch(pool)
 
 	v1 := r.Group("/v1")
 	{
+		v1.POST("/artists", artists.Create)
+		v1.GET("/artists/:id", artists.Get)
+
 		v1.GET("/tracks/:id", tracks.Get)
 		v1.POST("/tracks", tracks.Create)
 		v1.GET("/tracks/:id/stream", tracks.Stream)
