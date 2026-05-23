@@ -1,0 +1,92 @@
+# Beatstream — Progress Tracker
+
+## Currently on Phase 1 ✅
+
+---
+
+## Phase 0 — Local Monolith ✅
+> Goal: get the service running — upload, stream, search
+
+**Files added:**
+```
+beatstream/
+├── cmd/api/main.go                  # entrypoint: routing, graceful shutdown
+├── internal/db/postgres.go          # PostgreSQL connection + migrations
+├── internal/storage/s3.go           # MinIO (S3-compatible) upload / pre-signed URL
+├── internal/handler/tracks.go       # GET /tracks/:id, POST /tracks, GET /tracks/:id/stream
+├── internal/handler/artists.go      # GET /artists/:id, POST /artists
+├── internal/handler/playlists.go    # playlist CRUD
+├── internal/handler/search.go       # GET /search (PostgreSQL full-text)
+├── internal/middleware/requestid.go # X-Request-ID header
+├── db/migrations/                   # 001 tracks, 002 playlists, 003 play_events, seed
+├── Dockerfile                       # multi-stage build (golang → alpine)
+└── docker-compose.yml               # postgres, redis, minio, prometheus, grafana
+```
+
+**Key questions you should be able to answer:**
+- Why use a pre-signed URL instead of proxying audio through the API server?
+- Why is `play_events` a separate table instead of just a counter on `tracks`?
+
+---
+
+## Phase 1 — Load Balancing & Caching ✅
+> Goal: put the system under load, find the bottleneck, fix it with caching and rate limiting
+
+**Files added:**
+```
+beatstream/
+├── nginx/nginx.conf                           # upstream × 3, least_conn, health checks
+├── internal/cache/redis.go                    # Redis client wrapper
+├── internal/metrics/metrics.go                # Prometheus counters / histograms
+├── internal/middleware/ratelimit.go            # token bucket rate limiter (Redis Lua script)
+├── internal/middleware/prometheus.go           # records latency + count per request
+├── grafana/provisioning/datasources/          # auto-provisions Prometheus datasource
+└── grafana/provisioning/dashboards/           # Beatstream Phase 1 dashboard (6 panels)
+```
+
+**Files modified:**
+```
+├── internal/handler/tracks.go   # + cache-aside on GET /tracks/:id (1h TTL)
+├── internal/handler/search.go   # + cache search results (1min TTL)
+├── cmd/api/main.go               # + Redis connection, rate limiter on /stream, metrics server
+└── prometheus.yml                # + explicit /metrics scrape path
+```
+
+**Key questions you should be able to answer:**
+- What is the difference between cache-aside and write-through?
+- Why does the token bucket rate limiter use a Lua script instead of regular Redis commands?
+- After adding the rate limiter, the k6 error rate jumped to 20%. Is that a bug?
+
+**Experiments to run:**
+```bash
+# 1. Kill one API instance — does traffic automatically shift to the other two?
+docker compose stop api-2
+k6 run -e TRACK_ID=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa k6/load.js
+
+# 2. Kill Redis — does the API keep serving? (fail-open design)
+docker compose stop redis
+curl http://localhost/v1/tracks/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
+```
+
+---
+
+## Phase 2 — Async & Queues ⬜
+> Goal: decouple upload processing, handle play events at scale with Kafka
+
+**Will add:**
+```
+beatstream/
+├── docker-compose.yml      # + Redpanda (Kafka-compatible, simpler local setup)
+├── internal/worker/        # analytics worker (play-events), upload worker (transcoding)
+└── db/migrations/          # add status column to tracks (pending | processing | ready | error)
+```
+
+**Interview questions coming up:**
+- Why use async processing for audio uploads? When do you return 202 vs 200?
+- A Kafka consumer crashes mid-processing and restarts. How do you avoid processing the same event twice?
+
+---
+
+## Phase 3 — Kubernetes ⬜
+## Phase 4 — Cloud Deployment ⬜
+## Phase 5 — Observability ⬜

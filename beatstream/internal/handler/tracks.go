@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,16 +10,19 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/vic4code/system-design-lab/beatstream/internal/cache"
+	"github.com/vic4code/system-design-lab/beatstream/internal/metrics"
 	"github.com/vic4code/system-design-lab/beatstream/internal/storage"
 )
 
 type Tracks struct {
 	db    *pgxpool.Pool
 	store *storage.MinIO
+	cache *cache.Redis
 }
 
-func NewTracks(db *pgxpool.Pool, store *storage.MinIO) *Tracks {
-	return &Tracks{db: db, store: store}
+func NewTracks(db *pgxpool.Pool, store *storage.MinIO, c *cache.Redis) *Tracks {
+	return &Tracks{db: db, store: store, cache: c}
 }
 
 type trackRow struct {
@@ -38,6 +42,18 @@ func (h *Tracks) Get(c *gin.Context) {
 		return
 	}
 
+	// Cache-aside: return cached metadata if available (1h TTL).
+	cacheKey := fmt.Sprintf("track:%s", id)
+	if cached, err := h.cache.Get(c.Request.Context(), cacheKey); err == nil {
+		var t trackRow
+		if json.Unmarshal([]byte(cached), &t) == nil {
+			metrics.CacheHits.WithLabelValues("track").Inc()
+			c.JSON(http.StatusOK, t)
+			return
+		}
+	}
+	metrics.CacheMisses.WithLabelValues("track").Inc()
+
 	var t trackRow
 	err := h.db.QueryRow(c.Request.Context(),
 		`SELECT id, title, artist_id, duration_ms, release_date::TEXT, play_count, created_at
@@ -46,6 +62,10 @@ func (h *Tracks) Get(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusNotFound, apiError("track not found"))
 		return
+	}
+
+	if data, err := json.Marshal(t); err == nil {
+		h.cache.Set(c.Request.Context(), cacheKey, string(data), time.Hour)
 	}
 	c.JSON(http.StatusOK, t)
 }

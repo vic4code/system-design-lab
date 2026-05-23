@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/vic4code/system-design-lab/beatstream/internal/cache"
 	"github.com/vic4code/system-design-lab/beatstream/internal/db"
 	"github.com/vic4code/system-design-lab/beatstream/internal/handler"
 	"github.com/vic4code/system-design-lab/beatstream/internal/middleware"
@@ -40,15 +42,19 @@ func main() {
 		log.Fatalf("minio connect: %v", err)
 	}
 
-	// Ensure bucket exists
 	if err := store.EnsureBucket(context.Background()); err != nil {
 		log.Fatalf("minio ensure bucket: %v", err)
 	}
 
-	r := gin.New()
-	r.Use(gin.Logger(), gin.Recovery(), middleware.RequestID())
+	// Connect to Redis
+	rdb, err := cache.NewRedis(mustEnv("REDIS_URL"))
+	if err != nil {
+		log.Fatalf("redis connect: %v", err)
+	}
 
-	// Health endpoints
+	r := gin.New()
+	r.Use(gin.Logger(), gin.Recovery(), middleware.RequestID(), middleware.PrometheusMetrics())
+
 	r.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
@@ -60,11 +66,10 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"status": "ready"})
 	})
 
-	// v1 API
 	artists := handler.NewArtists(pool)
-	tracks := handler.NewTracks(pool, store)
+	tracks := handler.NewTracks(pool, store, rdb)
 	playlists := handler.NewPlaylists(pool)
-	search := handler.NewSearch(pool)
+	search := handler.NewSearch(pool, rdb)
 
 	v1 := r.Group("/v1")
 	{
@@ -73,7 +78,11 @@ func main() {
 
 		v1.GET("/tracks/:id", tracks.Get)
 		v1.POST("/tracks", tracks.Create)
-		v1.GET("/tracks/:id/stream", tracks.Stream)
+		// Rate-limit stream endpoint: 100/hour for unauthenticated, unlimited for auth.
+		v1.GET("/tracks/:id/stream",
+			middleware.StreamRateLimit(rdb.Client(), 100),
+			tracks.Stream,
+		)
 
 		v1.GET("/playlists/:id", playlists.Get)
 		v1.POST("/playlists", playlists.Create)
@@ -94,7 +103,18 @@ func main() {
 		Handler: r,
 	}
 
-	// Graceful shutdown
+	// Metrics server exposes /metrics for Prometheus scraping.
+	metricsPort := os.Getenv("METRICS_PORT")
+	if metricsPort == "" {
+		metricsPort = "9090"
+	}
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", promhttp.Handler())
+	metricsSrv := &http.Server{
+		Addr:    ":" + metricsPort,
+		Handler: metricsMux,
+	}
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
@@ -104,15 +124,20 @@ func main() {
 			log.Fatalf("server: %v", err)
 		}
 	}()
+	go func() {
+		log.Printf("metrics server listening on :%s/metrics", metricsPort)
+		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("metrics server: %v", err)
+		}
+	}()
 
 	<-quit
 	log.Println("shutting down...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("server shutdown: %v", err)
-	}
+	srv.Shutdown(ctx)
+	metricsSrv.Shutdown(ctx)
 }
 
 func mustEnv(key string) string {

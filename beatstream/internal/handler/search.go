@@ -1,18 +1,28 @@
 package handler
 
 import (
+	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/vic4code/system-design-lab/beatstream/internal/cache"
+	"github.com/vic4code/system-design-lab/beatstream/internal/metrics"
 )
 
 type Search struct {
-	db *pgxpool.Pool
+	db    *pgxpool.Pool
+	cache *cache.Redis
 }
 
-func NewSearch(db *pgxpool.Pool) *Search {
-	return &Search{db: db}
+func NewSearch(db *pgxpool.Pool, c *cache.Redis) *Search {
+	return &Search{db: db, cache: c}
+}
+
+type searchResponse struct {
+	Items []trackRow `json:"items"`
+	Total int        `json:"total"`
 }
 
 func (h *Search) Search(c *gin.Context) {
@@ -21,6 +31,18 @@ func (h *Search) Search(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiError("q parameter is required"))
 		return
 	}
+
+	// Return cached search results if available (1min TTL — balances freshness vs. DB load).
+	cacheKey := "search:" + q
+	if cached, err := h.cache.Get(c.Request.Context(), cacheKey); err == nil {
+		var resp searchResponse
+		if json.Unmarshal([]byte(cached), &resp) == nil {
+			metrics.CacheHits.WithLabelValues("search").Inc()
+			c.JSON(http.StatusOK, resp)
+			return
+		}
+	}
+	metrics.CacheMisses.WithLabelValues("search").Inc()
 
 	// Full-text search using PostgreSQL tsvector, ranked by play_count.
 	// ts_rank weights recent plays more — play_count DESC is the tiebreaker.
@@ -50,7 +72,12 @@ func (h *Search) Search(c *gin.Context) {
 		results = []trackRow{}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"items": results, "total": len(results)})
+	resp := searchResponse{Items: results, Total: len(results)}
+	if data, err := json.Marshal(resp); err == nil {
+		h.cache.Set(c.Request.Context(), cacheKey, string(data), time.Minute)
+	}
+
+	c.JSON(http.StatusOK, resp)
 }
 
 // apiError is a shared helper for structured JSON error responses.
