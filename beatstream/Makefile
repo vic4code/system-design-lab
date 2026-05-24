@@ -12,13 +12,18 @@ down:
 logs:
 	docker compose logs -f api-1
 
-# Build the API binary
+# Build API and worker binaries
 build:
 	go build -o beatstream-api ./cmd/api
+	go build -o beatstream-worker ./cmd/worker
 
-# Run locally (requires postgres + minio running)
+# Run API locally (requires postgres, minio, redis, redpanda running)
 run:
 	go run ./cmd/api
+
+# Run worker locally
+run-worker:
+	go run ./cmd/worker
 
 # Run tests
 test:

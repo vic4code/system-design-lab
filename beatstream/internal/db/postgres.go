@@ -34,6 +34,7 @@ func Migrate(pool *pgxpool.Pool) error {
 		migrationTracks,
 		migrationPlaylists,
 		migrationPlayEvents,
+		migrationTrackStatus,
 	}
 	for _, m := range migrations {
 		if _, err := pool.Exec(context.Background(), m); err != nil {
@@ -100,4 +101,10 @@ CREATE TABLE IF NOT EXISTS play_events (
 
 CREATE INDEX IF NOT EXISTS play_events_track_idx ON play_events(track_id, played_at DESC);
 CREATE INDEX IF NOT EXISTS play_events_user_idx  ON play_events(user_id, played_at DESC);
+`
+
+// migrationTrackStatus adds the upload pipeline status column.
+// Default 'ready' keeps existing rows accessible without re-processing.
+const migrationTrackStatus = `
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ready';
 `
