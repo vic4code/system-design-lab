@@ -1,6 +1,6 @@
 # Beatstream — Progress Tracker
 
-## Currently on Phase 1 ✅
+## Currently on Phase 2 ⬜
 
 ---
 

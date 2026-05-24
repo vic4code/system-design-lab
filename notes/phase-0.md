@@ -60,6 +60,54 @@ Without this, killing the process mid-request drops responses. Docker and Kubern
 
 ---
 
+## MinIO — How Concurrent Streaming Works
+
+This was set up in Phase 0, but the internals matter for any interview question about concurrency.
+
+**Why MinIO can serve thousands of concurrent reads without multiplying memory:**
+
+The OS loads the file into **page cache** (RAM) once. Every reader gets their own file descriptor tracking an independent offset — they all read from the same underlying pages.
+
+```
+file on disk → loaded into page cache (one copy in RAM)
+
+fd_A: offset = 0        ─┐
+fd_B: offset = 0        ─┤  → all read from the same page cache
+fd_C: offset = 512000   ─┘
+```
+
+Reading is non-destructive: no locks needed for concurrent reads.
+
+**Go goroutines (one per HTTP connection):**
+
+- ~4KB stack each — not OS threads
+- Go runtime multiplexes many goroutines onto a few OS threads
+- When goroutine A waits for a network ACK, the runtime runs goroutine B — no thread is wasted waiting
+
+**Why memory doesn't multiply per listener:**
+
+Goroutines stream in small chunks (~64KB), not the whole file:
+
+```
+goroutine A:
+  copy 64KB from page cache → send to socket → free buffer
+  wait for ACK (Go runtime runs others here)
+  copy next 64KB → ...
+```
+
+Memory breakdown for 1000 concurrent 5MB streams:
+```
+page cache:              5MB   (one copy, shared)
+1000 × 64KB buffers:    64MB
+1000 × 8KB goroutines:   8MB
+──────────────────────────────
+total: ~77MB    (not 1000 × 5MB = 5GB)
+```
+
+Real bottleneck ordering: **network bandwidth first** (1Gbps ≈ 25 simultaneous 5MB streams), then RAM, then OS file descriptor limit (65536/process, configurable).
+
+---
+
 ## Gotchas discovered
 
 - MinIO pre-signed URLs use the **internal** Docker hostname (`minio:9000`) by default. If the client is outside Docker, it gets a URL it can't reach. Need to configure the external URL for production.
@@ -74,3 +122,6 @@ Without this, killing the process mid-request drops responses. Docker and Kubern
 
 **"How does pre-signed URL streaming work? Why not proxy through your API?"**
 > The API generates a time-limited URL signed with the object storage credentials and redirects the client there. The client streams directly from S3/MinIO. Proxying would funnel all audio bandwidth through the API — at any real scale that's the first thing to saturate.
+
+**"How does MinIO handle thousands of concurrent listeners without running out of memory?"**
+> The OS loads the file into page cache once. Each connection gets its own file descriptor tracking an independent offset — all reading from the same RAM pages. Go goroutines stream in 64KB chunks rather than loading the entire file, so 1000 concurrent listeners of a 5MB track use ~77MB, not 5GB.
