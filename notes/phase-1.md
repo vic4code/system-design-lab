@@ -1,5 +1,49 @@
 # Phase 1 — Load Balancing & Caching
 
+## Architecture
+
+```mermaid
+graph TD
+    Client(["Client / k6"])
+
+    subgraph Docker Compose
+        NGINX["nginx :80\nleast_conn LB\nhealth checks"]
+
+        subgraph "API Layer (×3)"
+            API1["api-1 :8080"]
+            API2["api-2 :8080"]
+            API3["api-3 :8080"]
+        end
+
+        REDIS["Redis :6379\ncache-aside\nrate limit bucket"]
+        PG[("PostgreSQL :5432")]
+        MINIO["MinIO :9000\nobject storage"]
+        PROM["Prometheus :9090\ntime-series DB"]
+        GRAFANA["Grafana :3000\ndashboard"]
+    end
+
+    Client -->|"HTTP :80"| NGINX
+    NGINX -->|"least_conn"| API1
+    NGINX --> API2
+    NGINX --> API3
+    API1 & API2 & API3 -->|"cache-aside\nrate limit tokens"| REDIS
+    API1 & API2 & API3 -->|SQL| PG
+    API1 & API2 & API3 -->|"presign URL"| MINIO
+    API1 & API2 & API3 -->|"expose :9090/metrics"| PROM
+    PROM -->|"PromQL"| GRAFANA
+    Client -->|"307 → direct stream"| MINIO
+
+    style NGINX fill:#009639,color:#fff
+    style API1 fill:#4f86c6,color:#fff
+    style API2 fill:#4f86c6,color:#fff
+    style API3 fill:#4f86c6,color:#fff
+    style REDIS fill:#d82c20,color:#fff
+    style PG fill:#336791,color:#fff
+    style MINIO fill:#c72c41,color:#fff
+    style PROM fill:#e6522c,color:#fff
+    style GRAFANA fill:#f46800,color:#fff
+```
+
 ## What we built
 
 Put the system under real load with k6 (up to 500 VUs), added Redis caching, a token bucket rate limiter, Prometheus metrics, and a Grafana dashboard. nginx load balances across 3 API instances.
@@ -445,16 +489,29 @@ URL expires after 1 hour. MinIO verifies the signature on every request — no c
 
 Open: http://localhost:3000 (admin / admin) → Dashboards → Beatstream — Phase 1
 
-### 6 panels and what to watch
+![Beatstream Phase 1 — Grafana dashboard under k6 load (500 VUs)](images/grafana-phase1.png)
 
-| Panel | What to look for |
-|-------|-----------------|
-| Request Rate by Endpoint | Traffic shape — /tracks/:id should dominate |
-| Error Rate (5xx/total) | Should be near 0%; spike = something broken |
-| Latency p95/p99 | p99 drops from ~50ms to ~2ms after cache warms up |
-| Redis Cache Hit Rate | Approaches 100% after first request per key |
-| Rate Limit Decisions | allowed vs denied ratio during load test |
-| Request Rate per Instance | Three lines should be roughly equal (least_conn working) |
+### What the screenshot shows
+
+The dashboard was captured during a k6 ramp-up from 0 → 200 VUs. Reading each panel:
+
+| Panel | What you're seeing |
+|-------|-------------------|
+| **Request Rate by Endpoint** | `/tracks/:id` (green) climbs to ~600 req/s; `/stream` (yellow) ~150 req/s — 80/20 split from the k6 script |
+| **Error Rate (5xx / total)** | "No data" = zero server errors throughout the test ✓ |
+| **Request Latency p95/p99** | Cold-start spike to ~25ms, then drops to ~5ms after Redis cache warms — visible "cliff" on the graph |
+| **Redis Cache Hit Rate** | 0% on cold start → ~100% within seconds; the sharp rise is the cache warming on first request per key |
+| **Rate Limit Decisions** | `allowed` (green) rising with traffic; `denied` (yellow) appearing as VUs exhaust 100-token buckets |
+| **Request Rate per API Instance** | api-1/2/3 three lines tracking together — least_conn distributes load evenly |
+
+### Grafana vs Postman
+
+| Tool | Use for |
+|------|---------|
+| Postman | "Does this endpoint return the right data?" (functional testing) |
+| Grafana | "How is the system behaving under load?" (observability) |
+
+Both are needed. Grafana can't tell you if the response body is correct. Postman can't tell you what p99 latency looks like under 500 VUs.
 
 ### Grafana vs Postman
 

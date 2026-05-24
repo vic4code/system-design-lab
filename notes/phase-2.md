@@ -1,5 +1,58 @@
 # Phase 2 — Async & Queues
 
+## Architecture
+
+```mermaid
+graph TD
+    Client(["Client"])
+
+    subgraph Docker Compose
+        NGINX["nginx :80"]
+
+        subgraph "API Layer (×3)"
+            API1["api-1"]
+            API2["api-2"]
+            API3["api-3"]
+        end
+
+        REDIS["Redis\ncache + rate limit"]
+        PG[("PostgreSQL\ntracks / play_events")]
+        MINIO["MinIO\naudio files"]
+        RP["Redpanda :9092\nKafka-compatible"]
+
+        subgraph "Worker"
+            UW["Upload Worker\ntrack.uploads consumer"]
+            AW["Analytics Worker\nplay.events consumer"]
+        end
+    end
+
+    Client -->|"POST /tracks"| NGINX
+    NGINX --> API1 & API2 & API3
+    API1 -->|"1 upload file"| MINIO
+    API1 -->|"2 INSERT status=pending"| PG
+    API1 -->|"3 publish track.uploads"| RP
+    API1 -->|"4 202 Accepted"| Client
+
+    UW -->|"consume track.uploads"| RP
+    UW -->|"UPDATE status=ready"| PG
+
+    Client -->|"GET /tracks/:id/stream"| NGINX
+    API2 -->|"publish play.events"| RP
+    AW -->|"consume play.events"| RP
+    AW -->|"INSERT play_events\nUPDATE play_count"| PG
+
+    style NGINX fill:#009639,color:#fff
+    style API1 fill:#4f86c6,color:#fff
+    style API2 fill:#4f86c6,color:#fff
+    style API3 fill:#4f86c6,color:#fff
+    style REDIS fill:#d82c20,color:#fff
+    style PG fill:#336791,color:#fff
+    style MINIO fill:#c72c41,color:#fff
+    style RP fill:#7b61ff,color:#fff
+    style UW fill:#2e7d32,color:#fff
+    style AW fill:#2e7d32,color:#fff
+```
+
 ## Goal
 
 Decouple two latency-sensitive paths from the synchronous request cycle:
