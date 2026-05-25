@@ -67,7 +67,11 @@ k8s-load:
 	kind load docker-image beatstream-worker:latest --name beatstream
 
 # Apply all K8s manifests
+# Namespace must be applied first and given time to propagate before other
+# resources are created, otherwise the API server returns NotFound errors.
 k8s-deploy:
+	kubectl apply -f k8s/namespace.yaml
+	kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/beatstream --timeout=15s
 	kubectl apply -f k8s/
 	kubectl -n beatstream rollout status deployment/api --timeout=120s
 
