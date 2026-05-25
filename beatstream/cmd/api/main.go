@@ -15,6 +15,7 @@ import (
 	"github.com/vic4code/system-design-lab/beatstream/internal/db"
 	"github.com/vic4code/system-design-lab/beatstream/internal/handler"
 	"github.com/vic4code/system-design-lab/beatstream/internal/middleware"
+	"github.com/vic4code/system-design-lab/beatstream/internal/queue"
 	"github.com/vic4code/system-design-lab/beatstream/internal/storage"
 )
 
@@ -52,6 +53,13 @@ func main() {
 		log.Fatalf("redis connect: %v", err)
 	}
 
+	// Connect to Redpanda (Kafka-compatible)
+	producer, err := queue.NewProducer(mustEnv("KAFKA_BROKERS"))
+	if err != nil {
+		log.Fatalf("kafka producer: %v", err)
+	}
+	defer producer.Close()
+
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery(), middleware.RequestID(), middleware.PrometheusMetrics())
 
@@ -67,7 +75,7 @@ func main() {
 	})
 
 	artists := handler.NewArtists(pool)
-	tracks := handler.NewTracks(pool, store, rdb)
+	tracks := handler.NewTracks(pool, store, rdb, producer)
 	playlists := handler.NewPlaylists(pool)
 	search := handler.NewSearch(pool, rdb)
 

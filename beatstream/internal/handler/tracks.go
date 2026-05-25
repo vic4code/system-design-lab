@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 
@@ -12,17 +14,20 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vic4code/system-design-lab/beatstream/internal/cache"
 	"github.com/vic4code/system-design-lab/beatstream/internal/metrics"
+	"github.com/vic4code/system-design-lab/beatstream/internal/queue"
 	"github.com/vic4code/system-design-lab/beatstream/internal/storage"
+	"github.com/vic4code/system-design-lab/beatstream/internal/worker"
 )
 
 type Tracks struct {
-	db    *pgxpool.Pool
-	store *storage.MinIO
-	cache *cache.Redis
+	db       *pgxpool.Pool
+	store    *storage.MinIO
+	cache    *cache.Redis
+	producer queue.Publisher
 }
 
-func NewTracks(db *pgxpool.Pool, store *storage.MinIO, c *cache.Redis) *Tracks {
-	return &Tracks{db: db, store: store, cache: c}
+func NewTracks(db *pgxpool.Pool, store *storage.MinIO, c *cache.Redis, p queue.Publisher) *Tracks {
+	return &Tracks{db: db, store: store, cache: c, producer: p}
 }
 
 type trackRow struct {
@@ -32,6 +37,7 @@ type trackRow struct {
 	DurationMs  int       `json:"duration_ms"`
 	ReleaseDate *string   `json:"release_date,omitempty"`
 	PlayCount   int64     `json:"play_count"`
+	Status      string    `json:"status"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
@@ -56,16 +62,19 @@ func (h *Tracks) Get(c *gin.Context) {
 
 	var t trackRow
 	err := h.db.QueryRow(c.Request.Context(),
-		`SELECT id, title, artist_id, duration_ms, release_date::TEXT, play_count, created_at
+		`SELECT id, title, artist_id, duration_ms, release_date::TEXT, play_count, status, created_at
 		 FROM tracks WHERE id = $1`, id).
-		Scan(&t.ID, &t.Title, &t.ArtistID, &t.DurationMs, &t.ReleaseDate, &t.PlayCount, &t.CreatedAt)
+		Scan(&t.ID, &t.Title, &t.ArtistID, &t.DurationMs, &t.ReleaseDate, &t.PlayCount, &t.Status, &t.CreatedAt)
 	if err != nil {
 		c.JSON(http.StatusNotFound, apiError("track not found"))
 		return
 	}
 
-	if data, err := json.Marshal(t); err == nil {
-		h.cache.Set(c.Request.Context(), cacheKey, string(data), time.Hour)
+	// Only cache ready tracks — pending/processing status changes and must not be frozen in cache.
+	if t.Status == "ready" {
+		if data, err := json.Marshal(t); err == nil {
+			h.cache.Set(c.Request.Context(), cacheKey, string(data), time.Hour)
+		}
 	}
 	c.JSON(http.StatusOK, t)
 }
@@ -81,13 +90,17 @@ func (h *Tracks) Stream(c *gin.Context) {
 		return
 	}
 
-	// Record play event (fire-and-forget; errors are non-fatal)
+	// Publish play event to Redpanda; analytics worker persists it asynchronously.
+	// Fire-and-forget: losing a play event is acceptable for analytics.
 	go func() {
-		h.db.Exec(c.Request.Context(),
-			`INSERT INTO play_events (track_id, source) VALUES ($1, $2)`,
-			id, c.GetHeader("X-Source"))
-		h.db.Exec(c.Request.Context(),
-			`UPDATE tracks SET play_count = play_count + 1 WHERE id = $1`, id)
+		ev := worker.PlayEvent{
+			TrackID:   id,
+			Source:    c.GetHeader("X-Source"),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		if err := h.producer.Publish(context.Background(), worker.TopicPlayEvents, id, ev); err != nil {
+			log.Printf("play event publish: %v", err)
+		}
 	}()
 
 	// Return a pre-signed URL valid for 1 hour — client streams directly from MinIO/S3.
@@ -145,18 +158,31 @@ func (h *Tracks) Create(c *gin.Context) {
 		return
 	}
 
+	// Insert with status='pending'; upload worker will transcode and flip to 'ready'.
 	var t trackRow
 	err = h.db.QueryRow(c.Request.Context(),
-		`INSERT INTO tracks (id, title, artist_id, audio_key)
-		 VALUES ($1, $2, $3, $4)
-		 RETURNING id, title, artist_id, duration_ms, NULL, play_count, created_at`,
+		`INSERT INTO tracks (id, title, artist_id, audio_key, status)
+		 VALUES ($1, $2, $3, $4, 'pending')
+		 RETURNING id, title, artist_id, duration_ms, NULL, play_count, status, created_at`,
 		trackID, title, artistID, audioKey).
-		Scan(&t.ID, &t.Title, &t.ArtistID, &t.DurationMs, &t.ReleaseDate, &t.PlayCount, &t.CreatedAt)
+		Scan(&t.ID, &t.Title, &t.ArtistID, &t.DurationMs, &t.ReleaseDate, &t.PlayCount, &t.Status, &t.CreatedAt)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, apiError("failed to save track"))
 		return
 	}
-	c.JSON(http.StatusCreated, t)
+
+	// Publish upload event; if this fails the track is stuck in 'pending'.
+	// Production fix: use the transactional outbox pattern to avoid this split-brain.
+	ev := worker.UploadEvent{TrackID: trackID, AudioKey: audioKey}
+	if err := h.producer.Publish(c.Request.Context(), worker.TopicUploads, trackID, ev); err != nil {
+		log.Printf("upload event publish: %v", err)
+		c.JSON(http.StatusInternalServerError, apiError("failed to queue upload"))
+		return
+	}
+
+	// 202 Accepted: the track is saved and queued for processing.
+	// Poll GET /tracks/:id until status == "ready".
+	c.JSON(http.StatusAccepted, t)
 }
 
 // bytesReader wraps []byte to implement io.Reader without importing bytes package name conflict.

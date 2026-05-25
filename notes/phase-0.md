@@ -1,5 +1,28 @@
 # Phase 0 — Local Monolith
 
+## Architecture
+
+```mermaid
+graph TD
+    Client(["Client"])
+
+    subgraph Docker Compose
+        API["API :8080\ncmd/api"]
+        PG[("PostgreSQL :5432\ntracks / artists\nplaylists / play_events")]
+        MINIO["MinIO :9000\naudio files\nobject storage"]
+    end
+
+    Client -->|"POST /tracks\nGET /tracks/:id\nGET /search"| API
+    API -->|SQL| PG
+    API -->|"upload / presign"| MINIO
+    Client -->|"GET /tracks/:id/stream → 307"| API
+    Client -->|"direct audio stream\n(pre-signed URL)"| MINIO
+
+    style API fill:#4f86c6,color:#fff
+    style PG fill:#336791,color:#fff
+    style MINIO fill:#c72c41,color:#fff
+```
+
 ## What we built
 
 A minimal Spotify-like API running as a single process with Postgres, MinIO (S3-compatible), and Redis — all in Docker Compose.

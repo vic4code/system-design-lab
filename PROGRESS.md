@@ -1,6 +1,6 @@
 # Beatstream — Progress Tracker
 
-## Currently on Phase 2 ⬜
+## Currently on Phase 3 ⬜
 
 ---
 
@@ -70,20 +70,48 @@ curl http://localhost/v1/tracks/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
 
 ---
 
-## Phase 2 — Async & Queues ⬜
+## Phase 2 — Async & Queues ✅
 > Goal: decouple upload processing, handle play events at scale with Kafka
 
-**Will add:**
+**Files added:**
 ```
 beatstream/
-├── docker-compose.yml      # + Redpanda (Kafka-compatible, simpler local setup)
-├── internal/worker/        # analytics worker (play-events), upload worker (transcoding)
-└── db/migrations/          # add status column to tracks (pending | processing | ready | error)
+├── internal/queue/kafka.go          # Producer + Consumer wrappers (franz-go, at-least-once)
+├── internal/worker/upload.go        # Transcoding worker: pending → processing → ready
+├── internal/worker/analytics.go     # Analytics worker: insert play_events + increment play_count
+├── cmd/worker/main.go               # Worker binary (runs both workers as goroutines)
+└── db/migrations/004_add_track_status.sql
 ```
 
-**Interview questions coming up:**
+**Files modified:**
+```
+├── internal/db/postgres.go          # + migration 004 (status column, default 'ready')
+├── internal/handler/tracks.go       # POST /tracks → 202 Accepted, publishes to track.uploads
+│                                    # GET /tracks/:id/stream → publishes to play.events
+├── cmd/api/main.go                  # + Kafka producer init
+├── docker-compose.yml               # + redpanda service, + worker service
+├── Dockerfile                       # multi-target build (api target, worker target)
+└── Makefile                         # + run-worker target
+```
+
+**Key questions you should be able to answer:**
 - Why use async processing for audio uploads? When do you return 202 vs 200?
 - A Kafka consumer crashes mid-processing and restarts. How do you avoid processing the same event twice?
+- What is the transactional outbox pattern and why do you need it here?
+
+**Experiments to run:**
+```bash
+# 1. Upload a track — check it starts as pending
+curl -X POST http://localhost/v1/tracks -F title="Test" -F artist_id=<id> -F audio=@song.mp3
+# → 202 {"status": "pending"}
+
+# 2. Poll until ready (worker takes ~2s to "transcode")
+curl http://localhost/v1/tracks/<id>
+# → {"status": "ready", "duration_ms": ...}
+
+# 3. Kill the worker mid-processing — restart it and verify the track ends up ready
+docker compose stop worker && docker compose start worker
+```
 
 ---
 
