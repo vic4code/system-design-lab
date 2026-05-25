@@ -24,7 +24,9 @@ func NewProducer(brokerList string) (*Producer, error) {
 	brokers := strings.Split(brokerList, ",")
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
-		kgo.RequiredAcks(kgo.AllISRAcks()),
+		kgo.RequiredAcks(kgo.LeaderAck()),
+		kgo.DisableIdempotentWrite(),
+		kgo.AllowAutoTopicCreation(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("kafka producer: %w", err)

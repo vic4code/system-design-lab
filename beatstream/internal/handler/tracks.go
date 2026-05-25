@@ -70,8 +70,11 @@ func (h *Tracks) Get(c *gin.Context) {
 		return
 	}
 
-	if data, err := json.Marshal(t); err == nil {
-		h.cache.Set(c.Request.Context(), cacheKey, string(data), time.Hour)
+	// Only cache ready tracks — pending/processing status changes and must not be frozen in cache.
+	if t.Status == "ready" {
+		if data, err := json.Marshal(t); err == nil {
+			h.cache.Set(c.Request.Context(), cacheKey, string(data), time.Hour)
+		}
 	}
 	c.JSON(http.StatusOK, t)
 }
