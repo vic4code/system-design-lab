@@ -53,6 +53,13 @@ spec:
             limits:
               cpu: "500m"
               memory: "256Mi"
+          lifecycle:
+            preStop:
+              exec:
+                # Sleep before shutdown so iptables rules propagate across all nodes.
+                # Without this, requests can still arrive at the pod after K8s removes
+                # it from endpoints but before kube-proxy updates the iptables rules.
+                command: ["sleep", "5"]
           # readinessProbe: traffic is sent to this pod ONLY when it passes.
           # Failing → pod removed from Service endpoints (no traffic) but not restarted.
           readinessProbe:
