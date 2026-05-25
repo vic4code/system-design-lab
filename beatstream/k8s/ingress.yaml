@@ -1,0 +1,32 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: beatstream
+  namespace: beatstream
+  annotations:
+    # Targets the NGINX Ingress Controller (most common).
+    # Install: kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/...
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"  # allow audio file uploads
+    nginx.ingress.kubernetes.io/use-regex: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: beatstream.local  # add "127.0.0.1 beatstream.local" to /etc/hosts for local dev
+      http:
+        paths:
+          - path: /v1/
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  name: http
+          - path: /(healthz|ready)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: api
+                port:
+                  name: http

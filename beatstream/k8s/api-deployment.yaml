@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: beatstream
+  labels:
+    app: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  # Zero-downtime rolling update: bring up 1 new pod before taking down any old pod.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1        # at most 4 pods (3+1) during update
+      maxUnavailable: 0  # never drop below 3 healthy pods
+  template:
+    metadata:
+      labels:
+        app: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Drain in-flight requests before the pod terminates.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: api
+          image: beatstream-api:latest
+          # IfNotPresent: use local image if present (needed for kind / minikube dev).
+          # Change to Always when using a remote registry.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          envFrom:
+            - configMapRef:
+                name: beatstream-config
+            - secretRef:
+                name: beatstream-secrets
+          resources:
+            # requests: what the scheduler reserves on the node.
+            # limits: hard ceiling; OOMKilled if memory is exceeded.
+            # HPA calculates utilization as (usage / request), so requests must be set.
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          # readinessProbe: traffic is sent to this pod ONLY when it passes.
+          # Failing → pod removed from Service endpoints (no traffic) but not restarted.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          # livenessProbe: if this fails, kubelet kills and restarts the pod.
+          # Use a cheaper check (no DB) so a slow DB doesn't cause cascading restarts.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3

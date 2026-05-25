@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: beatstream
+  labels:
+    app: worker
+spec:
+  # Start with 1 replica.
+  # To scale workers horizontally: increase replicas — each joins the same consumer group
+  # and Redpanda automatically rebalances partition ownership.
+  # Max useful replicas = number of topic partitions (currently 1 each).
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  strategy:
+    # Recreate (stop old, start new) avoids duplicate consumers in the same group
+    # during a rolling update if your consumer group has only 1 partition.
+    # Switch to RollingUpdate once you increase partition count.
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      terminationGracePeriodSeconds: 60  # give in-flight messages time to finish
+      containers:
+        - name: worker
+          image: beatstream-worker:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: beatstream-secrets
+                  key: DATABASE_URL
+            - name: KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: beatstream-config
+                  key: KAFKA_BROKERS
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"

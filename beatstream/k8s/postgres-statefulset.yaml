@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: beatstream
+spec:
+  serviceName: postgres  # must match the headless Service name
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: beatstream-secrets
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: beatstream-secrets
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: beatstream-secrets
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "user", "-d", "beatstream"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+  # volumeClaimTemplates: K8s automatically creates one PVC per pod.
+  # The PVC survives pod deletion/rescheduling — the data persists.
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi

@@ -115,6 +115,59 @@ docker compose stop worker && docker compose start worker
 
 ---
 
-## Phase 3 — Kubernetes ⬜
+## Phase 3 — Kubernetes ✅
+> Goal: replace Docker Compose with K8s manifests; add HPA, probes, ConfigMap/Secret, StatefulSets
+
+**Files added:**
+```
+beatstream/k8s/
+├── namespace.yaml             # beatstream namespace
+├── configmap.yaml             # non-sensitive env config (endpoints, ports)
+├── secret.yaml                # credentials (DATABASE_URL, MinIO, Redis)
+├── api-deployment.yaml        # Deployment: 3 replicas, RollingUpdate, liveness + readiness probes
+├── api-service.yaml           # ClusterIP Service (load-balances across API pods)
+├── api-hpa.yaml               # HPA: 2–10 pods, CPU 60%, memory 70%
+├── worker-deployment.yaml     # Deployment: 1 replica, Recreate strategy
+├── postgres-statefulset.yaml  # StatefulSet + volumeClaimTemplate (5Gi PVC per pod)
+├── postgres-service.yaml      # Headless service for stable pod DNS
+├── redis-deployment.yaml      # Deployment + ClusterIP service
+├── redpanda-statefulset.yaml  # StatefulSet + volumeClaimTemplate (10Gi) + headless service
+├── minio-deployment.yaml      # Deployment + ClusterIP service
+└── ingress.yaml               # Ingress (nginx-ingress): /v1/, /healthz, /ready
+```
+
+**Key questions you should be able to answer:**
+- What is the difference between livenessProbe and readinessProbe? Why should liveness never check the DB?
+- HPA is configured but pods aren't scaling. What would you check?
+- Why does Postgres use a StatefulSet instead of a Deployment?
+- Why does the worker use `strategy: Recreate` instead of RollingUpdate?
+
+**Experiments to run:**
+```bash
+# 1. Stand up the cluster
+make k8s-cluster
+make k8s-load
+make k8s-deploy
+
+# 2. Watch pods and HPA
+kubectl -n beatstream get pods,hpa -w
+
+# 3. Trigger scale-out: stress-test with k6 (run in docker compose first for real load)
+kubectl run -it --rm load --image=busybox -- \
+  wget -q -O- http://api.beatstream.svc.cluster.local/healthz
+
+# 4. Simulate pod crash and watch self-heal
+kubectl -n beatstream delete pod -l app=api --field-selector=status.phase=Running
+
+# 5. Rolling update (change image tag in api-deployment.yaml, then:)
+kubectl apply -f k8s/api-deployment.yaml
+kubectl -n beatstream rollout status deployment/api
+
+# 6. Rollback
+kubectl -n beatstream rollout undo deployment/api
+```
+
+---
+
 ## Phase 4 — Cloud Deployment ⬜
 ## Phase 5 — Observability ⬜

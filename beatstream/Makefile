@@ -1,4 +1,5 @@
-.PHONY: run build test migrate up down logs
+.PHONY: run build test migrate up down logs \
+        k8s-cluster k8s-load k8s-deploy k8s-status k8s-delete
 
 # Start all services
 up:
@@ -51,3 +52,29 @@ fmt:
 # Lint Go code
 lint:
 	golangci-lint run ./...
+
+# ── Phase 3: Kubernetes (kind) ─────────────────────────────────────────────
+
+# Create a local kind cluster
+k8s-cluster:
+	kind create cluster --name beatstream
+
+# Build images and load them into the kind cluster (bypasses a registry)
+k8s-load:
+	docker build -t beatstream-api:latest --target api .
+	docker build -t beatstream-worker:latest --target worker .
+	kind load docker-image beatstream-api:latest --name beatstream
+	kind load docker-image beatstream-worker:latest --name beatstream
+
+# Apply all K8s manifests
+k8s-deploy:
+	kubectl apply -f k8s/
+	kubectl -n beatstream rollout status deployment/api --timeout=120s
+
+# Show pod + HPA status
+k8s-status:
+	kubectl -n beatstream get pods,svc,hpa
+
+# Tear down the kind cluster
+k8s-delete:
+	kind delete cluster --name beatstream

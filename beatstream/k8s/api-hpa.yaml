@@ -1,0 +1,42 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+  namespace: beatstream
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    # Scale out when average CPU across all pods exceeds 60% of their request (100m).
+    # i.e., when average pod is using >60m CPU, add more pods.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    # Also scale on memory pressure.
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      # Wait 5 minutes of sustained low load before scaling down — prevents flapping.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60  # remove at most 1 pod per minute
+    scaleUp:
+      stabilizationWindowSeconds: 0  # react to spikes immediately
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30  # add at most 2 pods per 30 seconds
