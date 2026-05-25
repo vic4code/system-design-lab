@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redpanda
+  namespace: beatstream
+spec:
+  serviceName: redpanda
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redpanda
+  template:
+    metadata:
+      labels:
+        app: redpanda
+    spec:
+      containers:
+        - name: redpanda
+          image: docker.redpanda.com/redpandadata/redpanda:latest
+          # K8s `args:` overrides CMD but keeps ENTRYPOINT (/entrypoint.sh).
+          # Docker Compose `command:` also overrides only CMD.
+          # K8s `command:` would bypass /entrypoint.sh — do NOT use it here.
+          args:
+            - redpanda
+            - start
+            - --mode
+            - dev-container   # replaces --overprovisioned --reserve-memory 0M --check=false
+            - --smp
+            - "1"
+            - --memory
+            - 512M
+            - --node-id
+            - "0"
+            - --kafka-addr
+            - PLAINTEXT://0.0.0.0:9092
+            - --advertise-kafka-addr
+            - PLAINTEXT://redpanda:9092
+          ports:
+            - containerPort: 9092
+              name: kafka
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - rpk cluster health | grep -E 'Healthy:.+true'
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            failureThreshold: 10
+          volumeMounts:
+            - name: redpanda-data
+              mountPath: /var/lib/redpanda/data
+  volumeClaimTemplates:
+    - metadata:
+        name: redpanda-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redpanda
+  namespace: beatstream
+spec:
+  # Headless: gives each pod a stable FQDN (redpanda-0.redpanda.beatstream…)
+  # which matches the --advertise-kafka-addr above.
+  clusterIP: None
+  selector:
+    app: redpanda
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: 9092
