@@ -17,24 +17,22 @@ spec:
       containers:
         - name: redpanda
           image: docker.redpanda.com/redpandadata/redpanda:latest
-          command:
+          # K8s `args:` overrides CMD but keeps ENTRYPOINT (/entrypoint.sh).
+          # Docker Compose `command:` also overrides only CMD.
+          # K8s `command:` would bypass /entrypoint.sh — do NOT use it here.
+          args:
             - redpanda
             - start
-            - --overprovisioned
+            - --mode
+            - dev-container   # replaces --overprovisioned --reserve-memory 0M --check=false
             - --smp
             - "1"
             - --memory
             - 512M
-            - --reserve-memory
-            - 0M
             - --node-id
             - "0"
-            - --check=false
             - --kafka-addr
             - PLAINTEXT://0.0.0.0:9092
-            # Pod DNS in StatefulSet: redpanda-0.redpanda.beatstream.svc.cluster.local
-            # Headless service DNS resolves to the pod IP within the cluster.
-            # For multi-broker setups, use the pod FQDN: redpanda-N.redpanda.beatstream.svc.cluster.local
             - --advertise-kafka-addr
             - PLAINTEXT://redpanda:9092
           ports:
