@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: beatstream-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: ""
+    targetPort: 8080
+    dockerTarget: api
+    region: singapore
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: beatstream-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: beatstream-redis
+          property: connectionString
+      - key: PORT
+        value: "8080"
+      # Kafka and S3 intentionally omitted — optional, upload/stream disabled
+      # Set KAFKA_BROKERS and S3_BUCKET to re-enable those features
+
+databases:
+  - name: beatstream-db
+    databaseName: beatstream
+    plan: free
+    region: singapore
+
+  - name: beatstream-redis
+    type: redis
+    plan: free
+    region: singapore

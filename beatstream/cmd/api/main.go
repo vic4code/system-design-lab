@@ -37,23 +37,28 @@ func main() {
 	// AWS ECS:   leave S3_ENDPOINT unset — the task role provides credentials.
 	// S3_PRESIGN_ENDPOINT: browser-accessible URL for pre-signed audio links.
 	//   In docker-compose set to http://localhost:9000 so browsers can reach MinIO.
-	store, err := storage.New(ctx, storage.Config{
-		Bucket:          mustEnv("S3_BUCKET"),
-		Region:          getEnv("AWS_REGION", "us-east-1"),
-		Endpoint:        os.Getenv("S3_ENDPOINT"),
-		AccessKey:       os.Getenv("S3_ACCESS_KEY"),
-		SecretKey:       os.Getenv("S3_SECRET_KEY"),
-		PresignEndpoint: os.Getenv("S3_PRESIGN_ENDPOINT"),
-	})
-	if err != nil {
-		log.Fatalf("storage init: %v", err)
-	}
-	// EnsureBucket is a no-op when the bucket already exists (AWS path).
-	// For local MinIO it creates the bucket on first run.
-	if os.Getenv("S3_ENDPOINT") != "" {
-		if err := store.EnsureBucket(ctx); err != nil {
-			log.Fatalf("ensure bucket: %v", err)
+	// S3-compatible storage — optional. If S3_BUCKET is unset, upload and
+	// stream endpoints are disabled but all read endpoints remain functional.
+	var store *storage.Storage
+	if bucket := os.Getenv("S3_BUCKET"); bucket != "" {
+		store, err = storage.New(ctx, storage.Config{
+			Bucket:          bucket,
+			Region:          getEnv("AWS_REGION", "us-east-1"),
+			Endpoint:        os.Getenv("S3_ENDPOINT"),
+			AccessKey:       os.Getenv("S3_ACCESS_KEY"),
+			SecretKey:       os.Getenv("S3_SECRET_KEY"),
+			PresignEndpoint: os.Getenv("S3_PRESIGN_ENDPOINT"),
+		})
+		if err != nil {
+			log.Fatalf("storage init: %v", err)
 		}
+		if os.Getenv("S3_ENDPOINT") != "" {
+			if err := store.EnsureBucket(ctx); err != nil {
+				log.Fatalf("ensure bucket: %v", err)
+			}
+		}
+	} else {
+		log.Println("S3_BUCKET not set — upload/stream disabled")
 	}
 
 	rdb, err := cache.NewRedis(mustEnv("REDIS_URL"))
@@ -61,19 +66,22 @@ func main() {
 		log.Fatalf("redis connect: %v", err)
 	}
 
-	// Kafka producer.
-	// Local Redpanda: KAFKA_AUTH unset → plaintext.
-	// AWS MSK:        KAFKA_AUTH=iam → SASL/IAM via ECS task role.
+	// Kafka producer — optional. If KAFKA_BROKERS is unset the upload
+	// pipeline is disabled but all read endpoints remain functional.
 	var producer *queue.Producer
-	if os.Getenv("KAFKA_AUTH") == "iam" {
-		producer, err = queue.NewProducerIAM(mustEnv("KAFKA_BROKERS"), mustEnv("AWS_REGION"))
+	if brokers := os.Getenv("KAFKA_BROKERS"); brokers != "" {
+		if os.Getenv("KAFKA_AUTH") == "iam" {
+			producer, err = queue.NewProducerIAM(brokers, mustEnv("AWS_REGION"))
+		} else {
+			producer, err = queue.NewProducer(brokers)
+		}
+		if err != nil {
+			log.Fatalf("kafka producer: %v", err)
+		}
+		defer producer.Close()
 	} else {
-		producer, err = queue.NewProducer(mustEnv("KAFKA_BROKERS"))
+		log.Println("KAFKA_BROKERS not set — upload pipeline disabled")
 	}
-	if err != nil {
-		log.Fatalf("kafka producer: %v", err)
-	}
-	defer producer.Close()
 
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery(), middleware.CORS(), middleware.RequestID(), middleware.PrometheusMetrics())
