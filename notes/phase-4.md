@@ -1,27 +1,24 @@
-# Phase 4 — Cloud Deployment
+# Phase 4 — Frontend (Next.js)
 
 ## Architecture
 
 ```
-Internet
+Browser
   │
   ▼
-CloudFront (PriceClass_200 — covers Asia + US + Europe)
-  ├── /audio/*  ──────────────────► S3 (OAC, 24h cache)
-  └── default   ──────────────────► ALB (no cache)
-                                      │
-                                      ▼
-                           ECS Fargate — api (2 tasks, private subnets)
-                              │              │               │
-                           Aurora         Redis          MSK Serverless
-                      (Serverless v2)  (t4g.micro)       (IAM auth)
-                              │
-                       ECS Fargate — worker (1 task)
+Next.js 15 (beatstream/web/) — Vercel / Docker
+  │  App Router + Tailwind CSS (dark Spotify-like theme)
+  │
+  ├── /                  Track list + inline audio player
+  ├── /search            Debounced full-text search
+  ├── /upload            Multi-step upload → status polling
+  └── /playlists         Playlist CRUD + track management
+  │
+  │  rewrites: /v1/* → API_URL/v1/*
+  ▼
+Go API (port 8080)
+  └── CORS: Access-Control-Allow-Origin: *
 ```
-
-**Region:** ap-northeast-1 (Tokyo) — closest AWS region to Taiwan (~5ms vs 200ms to us-east-1).
-
-**AZs:** ap-northeast-1a + ap-northeast-1c. Two AZs is the minimum for HA; three would survive one AZ + one partial failure but costs 50% more.
 
 ---
 
@@ -29,180 +26,142 @@ CloudFront (PriceClass_200 — covers Asia + US + Europe)
 
 ```
 beatstream/
-├── infra/terraform/
-│   ├── main.tf             provider, backend (S3 optional)
-│   ├── variables.tf        aws_region, environment, db_password
-│   ├── outputs.tf          ALB DNS, CloudFront domain, ECR URLs, MSK ARN
-│   ├── vpc.tf              VPC 10.0.0.0/16, 2 public + 2 private subnets, NAT
-│   ├── security_groups.tf  ALB, API, worker, RDS, Redis, MSK SGs
-│   ├── iam.tf              ECS execution role + task role (S3 + MSK permissions)
-│   ├── ecr.tf              Two ECR repos: beatstream/api, beatstream/worker
-│   ├── alb.tf              ALB + target group (:8080/health) + HTTP listener
-│   ├── ecs.tf              Cluster, task defs (API + worker), services + circuit breaker
-│   ├── rds.tf              Aurora PostgreSQL Serverless v2 (0.5–4 ACUs)
-│   ├── elasticache.tf      Redis cache.t4g.micro
-│   ├── s3.tf               Audio bucket + public-access-block + lifecycle
-│   ├── cloudfront.tf       CDN: OAC for S3, CachingDisabled for API
-│   ├── msk.tf              MSK Serverless + null_resource to fetch bootstrap brokers
-│   └── terraform.tfvars.example
+├── web/
+│   ├── app/
+│   │   ├── layout.tsx          root layout, PlayerContext provider, Navbar
+│   │   ├── globals.css         Tailwind base + custom scrollbar
+│   │   ├── page.tsx            home: track list, playback via TrackRow
+│   │   ├── search/page.tsx     debounced search with 300ms input delay
+│   │   ├── upload/page.tsx     wraps UploadForm component
+│   │   └── playlists/
+│   │       ├── page.tsx        playlist list + create form
+│   │       └── [id]/page.tsx   playlist detail: tracks, add/remove
+│   ├── components/
+│   │   ├── Navbar.tsx          top nav with links
+│   │   ├── Player.tsx          fixed bottom audio bar (play/pause/seek)
+│   │   └── TrackRow.tsx        row: index/play, title, status badge, duration
+│   ├── context/
+│   │   └── PlayerContext.tsx   global play state (HTML5 Audio API)
+│   ├── lib/
+│   │   └── api.ts              typed fetch wrapper for all API endpoints
+│   ├── next.config.ts          /v1/* rewrite proxy to backend
+│   ├── vercel.json             framework=nextjs, region=sin1
+│   └── .gitignore
+├── internal/middleware/
+│   └── cors.go                 CORS headers (required for browser → API)
+└── .github/workflows/
+    └── vercel.yml              GitHub Actions: auto-deploy to Vercel on push to main
 ```
 
-**Go changes:**
+**Go API changes:**
 ```
-internal/storage/s3.go     rewrote: MinIO SDK → AWS SDK v2 (auto-detects local vs cloud)
-internal/queue/kafka.go    added NewProducerIAM / NewConsumerIAM for MSK IAM SASL
-internal/worker/upload.go  added kafkaAuth, awsRegion params
-internal/worker/analytics.go added kafkaAuth, awsRegion params
-cmd/api/main.go            new S3 env vars (S3_ENDPOINT/S3_BUCKET), KAFKA_AUTH support
-cmd/worker/main.go         KAFKA_AUTH=iam for MSK
-docker-compose.yml         MINIO_* → S3_* env vars
-```
-
----
-
-## Deployment sequence
-
-```bash
-# 1. Copy and fill in the vars file
-cp infra/terraform/terraform.tfvars.example infra/terraform/terraform.tfvars
-# edit terraform.tfvars: set db_password to something strong
-
-# 2. Initialise Terraform
-make infra-init
-
-# 3. Preview (check costs before applying)
-make infra-plan
-
-# 4. Create the stack (~15 min — MSK Serverless is the bottleneck)
-make infra-apply
-# After apply: null_resource auto-fetches MSK bootstrap brokers → SSM
-
-# 5. Build images and push to ECR
-make infra-push
-
-# 6. Force ECS to pull new images
-make infra-deploy
-
-# 7. Check it works
-curl http://$(cd infra/terraform && terraform output -raw alb_dns)/healthz
-# → {"status":"ok"}
+internal/handler/artists.go    added List() — GET /v1/artists
+internal/handler/tracks.go     added List() — GET /v1/tracks
+internal/handler/playlists.go  added List() — GET /v1/playlists
+internal/middleware/cors.go    new — wildcard CORS for browser access
+cmd/api/main.go                CORS middleware + new list routes registered
 ```
 
 ---
 
 ## Key design decisions
 
-### ECS Fargate vs EKS
+### HTML5 Audio + pre-signed URL streaming
 
-| | ECS Fargate | EKS |
-|---|---|---|
-| Control plane | Fully managed (no cost) | $0.10/hr per cluster = ~$73/mo |
-| Ops overhead | Low — no node management | High — node groups, upgrades |
-| K8s ecosystem | No (use AWS native) | Full kubectl/Helm/CRD support |
-| Portability | AWS-only | Can migrate to any K8s |
-| Auto-scaling | Service Auto Scaling + ALB | HPA + KEDA + Cluster Autoscaler |
-| Best for | Single cloud, smaller teams | Multi-cloud, large platform teams |
+The `GET /v1/tracks/:id/stream` endpoint returns a `307 Temporary Redirect` to a pre-signed S3 URL (valid 60s). The browser's `<audio>` element follows the redirect natively — no proxy needed, bandwidth goes S3 → browser directly.
 
-**Why ECS for Phase 4:** We already learned K8s in Phase 3. ECS tests whether you can navigate the AWS-native approach and explain the trade-offs in an interview.
+`S3_PRESIGN_ENDPOINT` env var separates the internal endpoint (MinIO container DNS) from the browser-accessible one (localhost:9000 in dev, real AWS in prod).
 
-### Aurora Serverless v2 vs RDS PostgreSQL
+### PlayerContext global state
 
-| | Aurora Serverless v2 | RDS PostgreSQL |
-|---|---|---|
-| Scaling | Auto (0.5–128 ACUs, ~seconds) | Manual (instance resize = downtime) |
-| Cost at idle | ~$0.10/hr (0.5 ACU) | ~$0.017/hr (t3.micro) |
-| Cost at peak | Higher per-unit than provisioned | Predictable |
-| Cold start | ~1s lag when scaling from minimum | None |
-| HA | Multi-AZ by default | Multi-AZ costs 2x |
+The audio player needs to persist across page navigations (App Router navigates without unmounting the root layout). A React Context at the root layout level holds the `Audio` object — created once in a `useEffect` so it only runs client-side (avoids SSR issues with `window`).
 
-**When to choose Aurora:** Spiky or unpredictable workloads where you want automatic scaling without pre-provisioning. Good default for a dev environment.
-
-### CloudFront OAC vs direct S3
-
-Without CloudFront:
-- User in Taiwan → S3 ap-northeast-1: ~5ms (same region, fast)
-- User in Europe → S3 ap-northeast-1: ~180ms (cross-region)
-
-With CloudFront (PriceClass_200 includes Europe, Asia):
-- User in Europe → Frankfurt PoP: ~2ms after cache fill
-- Cache hit rate for popular tracks: ~95%+ (immutable files)
-
-The real win: **bandwidth cost**. CloudFront → origin (S3) data transfer is $0.06/GB. S3 → internet is $0.09/GB. For 1TB/month, CloudFront saves ~$30 AND is faster. For audio streaming at scale the math heavily favours CDN.
-
-### MSK Serverless IAM auth
-
-MSK Serverless only supports SASL/IAM — no plaintext, no SCRAM. The franz-go SASL AWS package handles the OAUTHBEARER token flow using SigV4 signing.
-
-Key insight: the ECS task role credentials are injected via the [ECS credential provider](https://docs.aws.amazon.com/sdkref/latest/guide/feature-container-credentials.html). The container never handles actual AWS keys — the ECS agent rotates temporary credentials automatically.
-
----
-
-## Cost estimate (10K DAU, ap-northeast-1)
-
-| Service | Size | ~Monthly |
-|---|---|---|
-| ECS Fargate API (2 tasks × 0.5 vCPU, 1GB) | 730 hr/mo | $18 |
-| ECS Fargate Worker (1 task × 0.25 vCPU) | 730 hr/mo | $4 |
-| Aurora Serverless v2 (avg 1 ACU) | | $50 |
-| ElastiCache t4g.micro | | $12 |
-| MSK Serverless (low volume) | ~$0.011/hr base | $8 |
-| ALB | | $20 |
-| NAT Gateway | | $35 |
-| CloudFront (100GB/mo) | | $9 |
-| S3 (50GB audio) | | $1 |
-| **Total** | | **~$157/mo** |
-
-NAT Gateway is surprisingly expensive (~$0.045/GB data processed + $32/mo fixed). For a production system: use S3/ECR VPC endpoints to avoid routing S3 and ECR traffic through NAT (~40% of NAT cost at scale).
-
----
-
-## Simulating AZ failure
-
-```bash
-# Find tasks in AZ-a
-aws ecs list-tasks --cluster beatstream --query taskArns
-
-# Stop all tasks (ECS will restart them; ALB drains connections first)
-# In practice: terminate EC2 instances in AZ-a, or use AWS Fault Injection Simulator
-
-# Watch ALB route around the failure — should see 0 errors
-k6 run k6/load.js &
-aws ecs update-service --cluster beatstream --service beatstream-api \
-  --placement-constraints '[{"type":"memberOf","expression":"attribute:ecs.availability-zone != ap-northeast-1a"}]'
+```
+layout.tsx  →  PlayerContext (Audio instance lives here)
+  ├── Navbar.tsx
+  ├── {children}  — any page can call usePlayer() to play/pause/seek
+  └── Player.tsx  — reads context, renders fixed bottom bar
 ```
 
-Expected: ALB detects unhealthy tasks (3 failed health checks × 30s = ~90s), drains connections, routes to healthy tasks. p99 latency spikes during failover but error rate stays 0% if connection draining works.
+### Next.js rewrites vs CORS
+
+Two options for local dev:
+
+| | Rewrites | CORS headers |
+|---|---|---|
+| Setup | next.config.ts rewrite rule | Go middleware |
+| Browser sees | Same origin (`localhost:3000/v1/*`) | Cross-origin (port 8080) |
+| Cookie support | Yes (same-origin) | Requires `credentials: include` |
+| Prod | Works without CORS if same domain | Needed if frontend on different domain |
+
+Both are implemented: rewrites handle local dev; CORS headers handle prod (Vercel domain ≠ API domain until custom domain is set up).
+
+### UploadForm state machine
+
+```
+idle → uploading (POST /v1/tracks, multipart)
+     → polling   (GET /v1/tracks/:id every 2s)
+     → ready     (status = ready, show player button)
+     → error     (status = error, show retry)
+```
+
+Worker pipeline (from Phase 2): Kafka → upload worker → S3 → updates track status in DB.
 
 ---
 
-## Measuring real-world latency
+## CI/CD: Vercel deployment
 
-```bash
-# From Taiwan to ap-northeast-1 CloudFront
-for i in $(seq 10); do
-  curl -o /dev/null -s -w "%{time_total}\n" \
-    https://$(cd infra/terraform && terraform output -raw cloudfront_domain)/healthz
-done | awk '{s+=$1} END {print "p50:", s/NR}'
-
-# Compare: direct ALB (bypasses CDN)
-curl -o /dev/null -s -w "time: %{time_total}s\n" \
-  http://$(cd infra/terraform && terraform output -raw alb_dns)/healthz
+```yaml
+# .github/workflows/vercel.yml
+on:
+  push:
+    branches: [main]
+    paths: ["beatstream/web/**"]
+  pull_request:
+    branches: [main]
+    paths: ["beatstream/web/**"]
 ```
 
-Typical results from Taiwan:
-- API (ALB, same region): ~5–15ms
-- Audio (CloudFront, cache hit): ~3–8ms
-- Audio (CloudFront, cache miss → S3): ~25–40ms
+Flow:
+1. Validate `VERCEL_TOKEN` secret exists
+2. Resolve (or auto-create) Vercel project `beatstream` via REST API
+3. `vercel build --prod` (runs inside `beatstream/web/`)
+4. **main push** → `vercel deploy --prebuilt --prod`
+5. **PR** → `vercel deploy --prebuilt` (preview) + posts preview URL as PR comment
+
+**Setup steps:**
+1. Vercel account → Settings → Tokens → create a token
+2. GitHub repo → Settings → Secrets → `VERCEL_TOKEN`
+3. Next push to main touching `beatstream/web/**` triggers first deploy
+
+---
+
+## Running locally
+
+```bash
+# Start backend
+make up
+
+# Install and start frontend
+make web-install
+make web-dev
+# → http://localhost:3000
+
+# Environment (optional — defaults work for docker-compose)
+# beatstream/web/.env.local:
+# NEXT_PUBLIC_API_URL=   (empty = use rewrites proxy)
+# API_URL=http://localhost:8080  (for server-side rewrites)
+```
 
 ---
 
 ## Interview questions to answer before Phase 5
 
-> *"Walk me through your AWS architecture. Why did you choose ECS over EKS?"*
-> See design decisions above. Key points: no control plane cost, simpler ops, AWS-native integrations, sufficient for a team that isn't already running K8s at scale.
+> *"How does the audio player avoid buffering the whole file?"*
+> The pre-signed URL points directly to S3. The browser sends HTTP Range requests natively (`Range: bytes=0-`), so it streams in chunks. S3 supports partial content responses (206). No server proxy means the API doesn't become a bandwidth bottleneck.
 
-> *"What happens when an availability zone goes down?"*
-> ALB stops routing to unhealthy tasks (after 3 health check failures × 30s). ECS launches replacement tasks in the surviving AZ. RDS Aurora promotes a replica to writer (usually <30s). Redis is a single node in this setup — it would be unavailable until ECS brings up a replacement (cache miss fallback in the API). For production: use ElastiCache Replication Group with a replica in each AZ.
+> *"Why React Context instead of Zustand/Redux for player state?"*
+> The state surface is small (one track, one Audio object, play/pause, progress). Context avoids adding a dependency. If we add features like queue management, offline support, or cross-tab sync — then a proper store makes sense.
 
-> *"Why is the NAT Gateway so expensive?"*
-> NAT charges $0.045/GB processed + $0.045/hr. ECS tasks pulling from ECR, writing to S3, and connecting to MSK all go through NAT. The fix: VPC endpoints for S3, ECR, and MSK so that traffic stays on the AWS backbone (free for gateway endpoints, fixed hourly rate for interface endpoints).
+> *"What breaks when you navigate between pages?"*
+> Nothing — the `Audio` object lives in the Context provider which wraps the entire app. Next.js App Router only unmounts/remounts `{children}`, not the root layout. The Player bar stays mounted and keeps playing.
