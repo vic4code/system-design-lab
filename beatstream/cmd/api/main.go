@@ -20,41 +20,53 @@ import (
 )
 
 func main() {
-	// Connect to PostgreSQL
+	ctx := context.Background()
+
 	pool, err := db.Connect(mustEnv("DATABASE_URL"))
 	if err != nil {
 		log.Fatalf("db connect: %v", err)
 	}
 	defer pool.Close()
 
-	// Run migrations on startup
 	if err := db.Migrate(pool); err != nil {
 		log.Fatalf("db migrate: %v", err)
 	}
 
-	// Connect to MinIO (S3-compatible)
-	store, err := storage.NewMinIO(storage.Config{
-		Endpoint:  mustEnv("MINIO_ENDPOINT"),
-		AccessKey: mustEnv("MINIO_ACCESS_KEY"),
-		SecretKey: mustEnv("MINIO_SECRET_KEY"),
-		Bucket:    mustEnv("MINIO_BUCKET"),
+	// S3-compatible storage.
+	// Local dev: set S3_ENDPOINT=http://minio:9000 + S3_ACCESS_KEY/S3_SECRET_KEY.
+	// AWS ECS:   leave S3_ENDPOINT unset — the task role provides credentials.
+	store, err := storage.New(ctx, storage.Config{
+		Bucket:    mustEnv("S3_BUCKET"),
+		Region:    getEnv("AWS_REGION", "us-east-1"),
+		Endpoint:  os.Getenv("S3_ENDPOINT"),
+		AccessKey: os.Getenv("S3_ACCESS_KEY"),
+		SecretKey: os.Getenv("S3_SECRET_KEY"),
 	})
 	if err != nil {
-		log.Fatalf("minio connect: %v", err)
+		log.Fatalf("storage init: %v", err)
+	}
+	// EnsureBucket is a no-op when the bucket already exists (AWS path).
+	// For local MinIO it creates the bucket on first run.
+	if os.Getenv("S3_ENDPOINT") != "" {
+		if err := store.EnsureBucket(ctx); err != nil {
+			log.Fatalf("ensure bucket: %v", err)
+		}
 	}
 
-	if err := store.EnsureBucket(context.Background()); err != nil {
-		log.Fatalf("minio ensure bucket: %v", err)
-	}
-
-	// Connect to Redis
 	rdb, err := cache.NewRedis(mustEnv("REDIS_URL"))
 	if err != nil {
 		log.Fatalf("redis connect: %v", err)
 	}
 
-	// Connect to Redpanda (Kafka-compatible)
-	producer, err := queue.NewProducer(mustEnv("KAFKA_BROKERS"))
+	// Kafka producer.
+	// Local Redpanda: KAFKA_AUTH unset → plaintext.
+	// AWS MSK:        KAFKA_AUTH=iam → SASL/IAM via ECS task role.
+	var producer *queue.Producer
+	if os.Getenv("KAFKA_AUTH") == "iam" {
+		producer, err = queue.NewProducerIAM(mustEnv("KAFKA_BROKERS"), mustEnv("AWS_REGION"))
+	} else {
+		producer, err = queue.NewProducer(mustEnv("KAFKA_BROKERS"))
+	}
 	if err != nil {
 		log.Fatalf("kafka producer: %v", err)
 	}
@@ -64,6 +76,9 @@ func main() {
 	r.Use(gin.Logger(), gin.Recovery(), middleware.RequestID(), middleware.PrometheusMetrics())
 
 	r.GET("/healthz", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 	r.GET("/ready", func(c *gin.Context) {
@@ -86,7 +101,6 @@ func main() {
 
 		v1.GET("/tracks/:id", tracks.Get)
 		v1.POST("/tracks", tracks.Create)
-		// Rate-limit stream endpoint: 100/hour for unauthenticated, unlimited for auth.
 		v1.GET("/tracks/:id/stream",
 			middleware.StreamRateLimit(rdb.Client(), 100),
 			tracks.Stream,
@@ -101,27 +115,13 @@ func main() {
 		v1.GET("/search", search.Search)
 	}
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
+	port := getEnv("PORT", "8080")
+	srv := &http.Server{Addr: ":" + port, Handler: r}
 
-	srv := &http.Server{
-		Addr:    ":" + port,
-		Handler: r,
-	}
-
-	// Metrics server exposes /metrics for Prometheus scraping.
-	metricsPort := os.Getenv("METRICS_PORT")
-	if metricsPort == "" {
-		metricsPort = "9090"
-	}
+	metricsPort := getEnv("METRICS_PORT", "9090")
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", promhttp.Handler())
-	metricsSrv := &http.Server{
-		Addr:    ":" + metricsPort,
-		Handler: metricsMux,
-	}
+	metricsSrv := &http.Server{Addr: ":" + metricsPort, Handler: metricsMux}
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -142,10 +142,10 @@ func main() {
 	<-quit
 	log.Println("shutting down...")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	srv.Shutdown(ctx)
-	metricsSrv.Shutdown(ctx)
+	srv.Shutdown(shutCtx)
+	metricsSrv.Shutdown(shutCtx)
 }
 
 func mustEnv(key string) string {
@@ -154,4 +154,11 @@ func mustEnv(key string) string {
 		log.Fatalf("required env var %s is not set", key)
 	}
 	return v
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

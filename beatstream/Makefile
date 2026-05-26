@@ -1,5 +1,6 @@
 .PHONY: run build test migrate up down logs \
-        k8s-cluster k8s-load k8s-deploy k8s-status k8s-delete
+        k8s-cluster k8s-load k8s-deploy k8s-status k8s-delete \
+        infra-init infra-plan infra-apply infra-push infra-deploy infra-destroy
 
 # Start all services
 up:
@@ -82,3 +83,42 @@ k8s-status:
 # Tear down the kind cluster
 k8s-delete:
 	kind delete cluster --name beatstream
+
+# ── Phase 4: AWS Cloud Deployment ─────────────────────────────────────────────
+
+TERRAFORM_DIR = infra/terraform
+
+# Step 1: initialise Terraform and install providers
+infra-init:
+	cd $(TERRAFORM_DIR) && terraform init
+
+# Step 2: preview what will be created (requires terraform.tfvars)
+infra-plan:
+	cd $(TERRAFORM_DIR) && terraform plan
+
+# Step 3: create the full AWS stack (~15 min, MSK Serverless is the bottleneck)
+infra-apply:
+	cd $(TERRAFORM_DIR) && terraform apply
+
+# Step 4: build images, push to ECR, force new ECS deployment
+# Usage: AWS_ACCOUNT_ID=123456789012 make infra-push
+infra-push:
+	$(eval REGION    := $(shell cd $(TERRAFORM_DIR) && terraform output -raw alb_dns | xargs -I{} echo ap-northeast-1))
+	$(eval API_URL   := $(shell cd $(TERRAFORM_DIR) && terraform output -raw ecr_api_url))
+	$(eval WORKER_URL := $(shell cd $(TERRAFORM_DIR) && terraform output -raw ecr_worker_url))
+	aws ecr get-login-password --region ap-northeast-1 | docker login --username AWS --password-stdin $(API_URL)
+	docker build -t beatstream-api --target api .
+	docker build -t beatstream-worker --target worker .
+	docker tag beatstream-api:latest $(API_URL):latest
+	docker tag beatstream-worker:latest $(WORKER_URL):latest
+	docker push $(API_URL):latest
+	docker push $(WORKER_URL):latest
+
+# Step 5: force ECS to pull the latest images
+infra-deploy:
+	aws ecs update-service --cluster beatstream --service beatstream-api   --force-new-deployment --region ap-northeast-1
+	aws ecs update-service --cluster beatstream --service beatstream-worker --force-new-deployment --region ap-northeast-1
+
+# Tear down everything (will NOT delete the S3 bucket if it has objects — drain first)
+infra-destroy:
+	cd $(TERRAFORM_DIR) && terraform destroy

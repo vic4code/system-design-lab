@@ -21,12 +21,12 @@ import (
 
 type Tracks struct {
 	db       *pgxpool.Pool
-	store    *storage.MinIO
+	store    *storage.Storage
 	cache    *cache.Redis
 	producer queue.Publisher
 }
 
-func NewTracks(db *pgxpool.Pool, store *storage.MinIO, c *cache.Redis, p queue.Publisher) *Tracks {
+func NewTracks(db *pgxpool.Pool, store *storage.Storage, c *cache.Redis, p queue.Publisher) *Tracks {
 	return &Tracks{db: db, store: store, cache: c, producer: p}
 }
 

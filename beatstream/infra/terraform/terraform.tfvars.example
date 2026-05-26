@@ -1,0 +1,10 @@
+# Copy to terraform.tfvars and fill in real values.
+# Never commit terraform.tfvars — it is gitignored.
+
+aws_region   = "ap-northeast-1"
+environment  = "dev"
+db_password  = "CHANGE_ME_at_least_16_chars"
+
+# Update these after building and pushing images to ECR:
+# api_image_tag    = "abc1234"
+# worker_image_tag = "abc1234"

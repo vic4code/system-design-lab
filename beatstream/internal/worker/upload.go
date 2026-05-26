@@ -26,8 +26,14 @@ type UploadWorker struct {
 	db       *pgxpool.Pool
 }
 
-func NewUploadWorker(brokers string, db *pgxpool.Pool) (*UploadWorker, error) {
-	c, err := queue.NewConsumer(brokers, "upload-workers", TopicUploads)
+func NewUploadWorker(brokers, kafkaAuth, awsRegion string, db *pgxpool.Pool) (*UploadWorker, error) {
+	var c *queue.Consumer
+	var err error
+	if kafkaAuth == "iam" {
+		c, err = queue.NewConsumerIAM(brokers, awsRegion, "upload-workers", TopicUploads)
+	} else {
+		c, err = queue.NewConsumer(brokers, "upload-workers", TopicUploads)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("upload worker consumer: %w", err)
 	}

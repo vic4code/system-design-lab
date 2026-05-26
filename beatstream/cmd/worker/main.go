@@ -14,6 +14,8 @@ import (
 func main() {
 	brokers := mustEnv("KAFKA_BROKERS")
 	dbURL := mustEnv("DATABASE_URL")
+	kafkaAuth := getEnv("KAFKA_AUTH", "plain")
+	awsRegion := getEnv("AWS_REGION", "us-east-1")
 
 	pool, err := db.Connect(dbURL)
 	if err != nil {
@@ -25,13 +27,13 @@ func main() {
 		log.Fatalf("db migrate: %v", err)
 	}
 
-	uploadWorker, err := worker.NewUploadWorker(brokers, pool)
+	uploadWorker, err := worker.NewUploadWorker(brokers, kafkaAuth, awsRegion, pool)
 	if err != nil {
 		log.Fatalf("upload worker: %v", err)
 	}
 	defer uploadWorker.Close()
 
-	analyticsWorker, err := worker.NewAnalyticsWorker(brokers, pool)
+	analyticsWorker, err := worker.NewAnalyticsWorker(brokers, kafkaAuth, awsRegion, pool)
 	if err != nil {
 		log.Fatalf("analytics worker: %v", err)
 	}
@@ -48,7 +50,7 @@ func main() {
 	}()
 
 	go uploadWorker.Run(ctx)
-	analyticsWorker.Run(ctx) // blocks until ctx cancelled
+	analyticsWorker.Run(ctx)
 }
 
 func mustEnv(key string) string {
@@ -57,4 +59,11 @@ func mustEnv(key string) string {
 		log.Fatalf("required env var %s is not set", key)
 	}
 	return v
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

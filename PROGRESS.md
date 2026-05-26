@@ -1,6 +1,6 @@
 # Beatstream — Progress Tracker
 
-## Currently on Phase 3 ⬜
+## Currently on Phase 4 ⬜
 
 ---
 
@@ -170,4 +170,58 @@ kubectl -n beatstream rollout undo deployment/api
 ---
 
 ## Phase 4 — Cloud Deployment ⬜
+> Goal: deploy to real AWS using Terraform; feel real latency, real costs
+
+**Files added:**
+```
+beatstream/
+├── infra/terraform/
+│   ├── main.tf             provider, optional S3 backend
+│   ├── variables.tf        aws_region, environment, db_password
+│   ├── outputs.tf          ALB DNS, CloudFront domain, ECR URLs, MSK ARN
+│   ├── vpc.tf              VPC + 2 public/private subnets + NAT (single AZ trade-off)
+│   ├── security_groups.tf  ALB → API → RDS/Redis/MSK SG chain
+│   ├── iam.tf              ECS execution role + task role (S3 + MSK IAM)
+│   ├── ecr.tf              beatstream/api + beatstream/worker repos
+│   ├── alb.tf              ALB + target group + health check (/health)
+│   ├── ecs.tf              ECS cluster, task defs, services, circuit breaker
+│   ├── rds.tf              Aurora PostgreSQL Serverless v2 (0.5–4 ACUs)
+│   ├── elasticache.tf      Redis cache.t4g.micro in private subnet
+│   ├── s3.tf               Audio bucket + public-access-block + lifecycle rules
+│   ├── cloudfront.tf       OAC for S3, CachingDisabled for API
+│   ├── msk.tf              MSK Serverless + null_resource to populate SSM with brokers
+│   └── terraform.tfvars.example
+```
+
+**Go changes:**
+```
+internal/storage/s3.go      rewrote: MinIO SDK → AWS SDK v2 (S3_ENDPOINT for local dev)
+internal/queue/kafka.go     added NewProducerIAM / NewConsumerIAM (MSK SASL/IAM)
+internal/worker/{upload,analytics}.go  added kafkaAuth + awsRegion params
+cmd/api/main.go             S3_BUCKET/S3_ENDPOINT env vars; KAFKA_AUTH=iam support
+cmd/worker/main.go          KAFKA_AUTH=iam for MSK
+docker-compose.yml          MINIO_* → S3_* env vars
+```
+
+**Key questions you should be able to answer:**
+- Why ECS Fargate instead of EKS? What would make you choose EKS?
+- What happens when an availability zone goes down?
+- Why is NAT Gateway expensive and how would you reduce its cost at scale?
+- Audio is served via CloudFront. A user reports stale audio after you updated a track. How do you fix it?
+
+**Milestones:**
+```
+[ ] terraform plan shows no errors
+[ ] terraform apply creates full stack in ~15 minutes
+[ ] curl http://<ALB-DNS>/healthz returns 200
+[ ] Upload a track — confirm it ends up in S3
+[ ] Stream a track — confirm redirect goes to CloudFront URL (not direct S3)
+[ ] Terminate one ECS task — confirm ALB routes around it with 0 errors
+[ ] terraform destroy tears down cleanly (empty S3 bucket first)
+[ ] Document real p99 latency from Taiwan to ap-northeast-1
+[ ] Calculate actual monthly cost from the AWS bill
+```
+
+---
+
 ## Phase 5 — Observability ⬜
