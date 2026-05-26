@@ -41,6 +41,28 @@ type trackRow struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
+func (h *Tracks) List(c *gin.Context) {
+	rows, err := h.db.Query(c.Request.Context(),
+		`SELECT id, title, artist_id, duration_ms, release_date::TEXT, play_count, status, created_at
+		 FROM tracks ORDER BY created_at DESC LIMIT 50`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, apiError("failed to list tracks"))
+		return
+	}
+	defer rows.Close()
+
+	tracks := []trackRow{}
+	for rows.Next() {
+		var t trackRow
+		if err := rows.Scan(&t.ID, &t.Title, &t.ArtistID, &t.DurationMs,
+			&t.ReleaseDate, &t.PlayCount, &t.Status, &t.CreatedAt); err != nil {
+			continue
+		}
+		tracks = append(tracks, t)
+	}
+	c.JSON(http.StatusOK, gin.H{"items": tracks, "total": len(tracks)})
+}
+
 func (h *Tracks) Get(c *gin.Context) {
 	id := c.Param("id")
 	if _, err := uuid.Parse(id); err != nil {

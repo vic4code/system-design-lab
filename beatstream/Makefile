@@ -1,6 +1,7 @@
 .PHONY: run build test migrate up down logs \
         k8s-cluster k8s-load k8s-deploy k8s-status k8s-delete \
-        infra-init infra-plan infra-apply infra-push infra-deploy infra-destroy
+        infra-init infra-plan infra-apply infra-push infra-deploy infra-destroy \
+        web-install web-dev
 
 # Start all services
 up:
@@ -122,3 +123,13 @@ infra-deploy:
 # Tear down everything (will NOT delete the S3 bucket if it has objects — drain first)
 infra-destroy:
 	cd $(TERRAFORM_DIR) && terraform destroy
+
+# ── Frontend ───────────────────────────────────────────────────────────────────
+
+# Install frontend dependencies
+web-install:
+	cd web && npm install
+
+# Start Next.js dev server (requires docker compose up for the backend)
+web-dev:
+	cd web && npm run dev

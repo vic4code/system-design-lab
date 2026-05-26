@@ -16,26 +16,54 @@ import (
 // Storage wraps an S3-compatible object store.
 // Set Endpoint + AccessKey + SecretKey for local MinIO.
 // Leave Endpoint empty on AWS — the ECS task role provides credentials automatically.
+//
+// PresignEndpoint overrides the host in pre-signed URLs.
+// Use this in local dev so browsers receive localhost:9000 URLs instead of minio:9000.
 type Storage struct {
-	client *s3.Client
-	bucket string
+	uploadClient  *s3.Client
+	presignClient *s3.PresignClient
+	bucket        string
 }
 
 type Config struct {
-	Bucket    string
-	Region    string
-	Endpoint  string // optional: set for local MinIO (e.g. "http://minio:9000")
-	AccessKey string // optional: static credentials for local dev
-	SecretKey string
+	Bucket          string
+	Region          string
+	Endpoint        string // optional: internal endpoint (e.g. "http://minio:9000")
+	AccessKey       string // optional: static credentials for local dev
+	SecretKey       string
+	PresignEndpoint string // optional: browser-accessible endpoint for pre-signed URLs
 }
 
 func New(ctx context.Context, cfg Config) (*Storage, error) {
-	opts := []func(*config.LoadOptions) error{
-		config.WithRegion(cfg.Region),
+	uploadClient, err := buildClient(ctx, cfg.Region, cfg.Endpoint, cfg.AccessKey, cfg.SecretKey)
+	if err != nil {
+		return nil, fmt.Errorf("upload client: %w", err)
 	}
-	if cfg.AccessKey != "" {
+
+	// If PresignEndpoint differs from Endpoint, create a separate client for presigning
+	// so that generated URLs point to the browser-reachable address.
+	presignSrc := uploadClient
+	if cfg.PresignEndpoint != "" && cfg.PresignEndpoint != cfg.Endpoint {
+		presignSrc, err = buildClient(ctx, cfg.Region, cfg.PresignEndpoint, cfg.AccessKey, cfg.SecretKey)
+		if err != nil {
+			return nil, fmt.Errorf("presign client: %w", err)
+		}
+	}
+
+	return &Storage{
+		uploadClient:  uploadClient,
+		presignClient: s3.NewPresignClient(presignSrc),
+		bucket:        cfg.Bucket,
+	}, nil
+}
+
+func buildClient(ctx context.Context, region, endpoint, accessKey, secretKey string) (*s3.Client, error) {
+	opts := []func(*config.LoadOptions) error{
+		config.WithRegion(region),
+	}
+	if accessKey != "" {
 		opts = append(opts, config.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, ""),
+			credentials.NewStaticCredentialsProvider(accessKey, secretKey, ""),
 		))
 	}
 
@@ -45,31 +73,30 @@ func New(ctx context.Context, cfg Config) (*Storage, error) {
 	}
 
 	clientOpts := []func(*s3.Options){}
-	if cfg.Endpoint != "" {
+	if endpoint != "" {
 		clientOpts = append(clientOpts, func(o *s3.Options) {
-			o.BaseEndpoint = aws.String(cfg.Endpoint)
+			o.BaseEndpoint = aws.String(endpoint)
 			o.UsePathStyle = true // MinIO requires path-style addressing
 		})
 	}
 
-	client := s3.NewFromConfig(awsCfg, clientOpts...)
-	return &Storage{client: client, bucket: cfg.Bucket}, nil
+	return s3.NewFromConfig(awsCfg, clientOpts...), nil
 }
 
 // EnsureBucket creates the bucket if it does not exist.
 // Called in local dev only — AWS buckets are provisioned by Terraform.
 func (s *Storage) EnsureBucket(ctx context.Context) error {
-	_, err := s.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(s.bucket)})
+	_, err := s.uploadClient.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(s.bucket)})
 	if err == nil {
 		return nil
 	}
-	_, err = s.client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(s.bucket)})
+	_, err = s.uploadClient.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(s.bucket)})
 	return err
 }
 
 // Upload stores an audio file at key.
 func (s *Storage) Upload(ctx context.Context, key string, r io.Reader, size int64, contentType string) error {
-	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+	_, err := s.uploadClient.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(s.bucket),
 		Key:           aws.String(key),
 		Body:          r,
@@ -81,8 +108,7 @@ func (s *Storage) Upload(ctx context.Context, key string, r io.Reader, size int6
 
 // PresignedURL returns a time-limited URL for direct client download.
 func (s *Storage) PresignedURL(ctx context.Context, key string, ttl time.Duration) (*url.URL, error) {
-	presigner := s3.NewPresignClient(s.client)
-	req, err := presigner.PresignGetObject(ctx, &s3.GetObjectInput{
+	req, err := s.presignClient.PresignGetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
 	}, s3.WithPresignExpires(ttl))

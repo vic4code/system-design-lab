@@ -35,12 +35,15 @@ func main() {
 	// S3-compatible storage.
 	// Local dev: set S3_ENDPOINT=http://minio:9000 + S3_ACCESS_KEY/S3_SECRET_KEY.
 	// AWS ECS:   leave S3_ENDPOINT unset — the task role provides credentials.
+	// S3_PRESIGN_ENDPOINT: browser-accessible URL for pre-signed audio links.
+	//   In docker-compose set to http://localhost:9000 so browsers can reach MinIO.
 	store, err := storage.New(ctx, storage.Config{
-		Bucket:    mustEnv("S3_BUCKET"),
-		Region:    getEnv("AWS_REGION", "us-east-1"),
-		Endpoint:  os.Getenv("S3_ENDPOINT"),
-		AccessKey: os.Getenv("S3_ACCESS_KEY"),
-		SecretKey: os.Getenv("S3_SECRET_KEY"),
+		Bucket:          mustEnv("S3_BUCKET"),
+		Region:          getEnv("AWS_REGION", "us-east-1"),
+		Endpoint:        os.Getenv("S3_ENDPOINT"),
+		AccessKey:       os.Getenv("S3_ACCESS_KEY"),
+		SecretKey:       os.Getenv("S3_SECRET_KEY"),
+		PresignEndpoint: os.Getenv("S3_PRESIGN_ENDPOINT"),
 	})
 	if err != nil {
 		log.Fatalf("storage init: %v", err)
@@ -73,7 +76,7 @@ func main() {
 	defer producer.Close()
 
 	r := gin.New()
-	r.Use(gin.Logger(), gin.Recovery(), middleware.RequestID(), middleware.PrometheusMetrics())
+	r.Use(gin.Logger(), gin.Recovery(), middleware.CORS(), middleware.RequestID(), middleware.PrometheusMetrics())
 
 	r.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -96,8 +99,11 @@ func main() {
 
 	v1 := r.Group("/v1")
 	{
+		v1.GET("/artists", artists.List)
 		v1.POST("/artists", artists.Create)
 		v1.GET("/artists/:id", artists.Get)
+
+		v1.GET("/tracks", tracks.List)
 
 		v1.GET("/tracks/:id", tracks.Get)
 		v1.POST("/tracks", tracks.Create)
@@ -106,6 +112,7 @@ func main() {
 			tracks.Stream,
 		)
 
+		v1.GET("/playlists", playlists.List)
 		v1.GET("/playlists/:id", playlists.Get)
 		v1.POST("/playlists", playlists.Create)
 		v1.GET("/playlists/:id/tracks", playlists.ListTracks)
