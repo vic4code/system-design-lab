@@ -46,6 +46,7 @@ graph TD
 ## Goal
 
 Replace Docker Compose with Kubernetes to gain:
+
 1. **Automatic horizontal scaling** (HPA) — react to CPU spikes without manual intervention.
 2. **Self-healing** — pods that crash or fail health checks are automatically restarted or replaced.
 3. **Rolling zero-downtime deploys** — update the API without dropping requests.
@@ -61,7 +62,7 @@ beatstream/k8s/
 ├── configmap.yaml             # non-sensitive env config
 ├── secret.yaml                # credentials (DB, MinIO, Redis)
 ├── api-deployment.yaml        # Deployment: 3 replicas, rolling update, probes, preStop
-├── api-service.yaml           # ClusterIP Service → HPA target
+├── api-service.yaml           # ClusterIP Service
 ├── api-hpa.yaml               # HPA: 2–10 pods, CPU 60%, memory 70%
 ├── worker-deployment.yaml     # Deployment: 1 replica, Recreate strategy
 ├── postgres-statefulset.yaml  # StatefulSet + volumeClaimTemplate 5Gi
@@ -74,22 +75,22 @@ beatstream/k8s/
 
 ---
 
-## K8s Architecture — 大腦和手腳
+## Kubernetes Architecture
 
-K8s 分兩層：Control Plane（大腦）和 Worker Nodes（手腳）。
+K8s is split into two layers: the **Control Plane** (brain) and **Worker Nodes** (hands).
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                      Control Plane                          │
 │                                                             │
 │  ┌─────────────┐    ┌──────────┐    ┌───────────────────┐  │
-│  │  API Server │    │  etcd    │    │ Controller Manager │  │
-│  │  (唯一入口)  │◄──►│ (狀態DB) │    │  (幾十個 loop)    │  │
+│  │  API Server │◄──►│  etcd    │    │ Controller Manager │  │
+│  │ (only entry)│    │(state DB)│    │  (dozens of loops) │  │
 │  └──────┬──────┘    └──────────┘    └───────────────────┘  │
 │         │                                                   │
 │  ┌──────┴──────┐                                            │
 │  │  Scheduler  │                                            │
-│  │ (決定去哪台) │                                            │
+│  │(picks node) │                                            │
 │  └─────────────┘                                            │
 └──────────────────────────┬──────────────────────────────────┘
                            │ (watches API Server)
@@ -102,9 +103,9 @@ K8s 分兩層：Control Plane（大腦）和 Worker Nodes（手腳）。
    └─────────────┘  └─────────────┘  └─────────────┘
 ```
 
-### etcd — 唯一的真相來源
+### etcd — the single source of truth
 
-整個 K8s 的狀態都在 etcd 裡。你 apply 的所有 YAML、pod 在哪個 node、service 的 endpoint、secret 的內容，全部存在這個 key-value store。
+All K8s state lives in etcd: every YAML you applied, which node each pod is on, service endpoints, secret values.
 
 ```
 /registry/pods/beatstream/api-xxx        →  {spec, status, ...}
@@ -112,224 +113,232 @@ K8s 分兩層：Control Plane（大腦）和 Worker Nodes（手腳）。
 /registry/endpoints/beatstream/api       →  {10.244.0.23, 10.244.0.24, ...}
 ```
 
-**etcd 掛了 = 沒人知道「現在的狀態是什麼」。** 現有 pod 還會繼續跑（worker node 不依賴 etcd），但你無法新建、修改、刪除任何東西。
+If etcd goes down, the control plane loses the ability to create, modify, or delete anything. Existing pods keep running (worker nodes don't depend on etcd), but no new work can be scheduled. Production etcd must have 3 or 5 nodes for quorum.
 
-### API Server — 唯一的入口
+### API Server — the only entry point
 
-所有人（kubectl、kubelet、controller）都只能透過 API Server 跟 etcd 說話。它負責認證、授權（RBAC）、格式驗證，再把結果寫進 etcd。
+Everything (kubectl, kubelet, controllers) talks to etcd exclusively through the API Server. It handles authentication, RBAC authorization, schema validation, and then writes to etcd.
 
-最重要的功能：**watch 機制**。任何元件都可以說「幫我盯著這個資源，有變動立刻通知我」。整個 K8s 的反應速度靠這個，沒有輪詢。
+Key feature: **watch**. Any component can say "notify me immediately when this resource changes." The entire reactivity of K8s is built on watches, not polling.
 
-### Scheduler — 只做一件事
+### Scheduler — does exactly one thing
 
-發現有 Pod 沒有 `nodeName` 時，選一個 node 填進去。邏輯分兩步：
-1. **Filter**：哪些 node 能跑？（資源夠嗎？有 taint？符合 affinity？）
-2. **Score**：剩下的哪個最好？（資源最多、同類 pod 最少）
+When a Pod has no `nodeName`, the Scheduler picks one and writes it in. Two steps:
 
-Scheduler 只寫 `nodeName`，不啟動任何 container。
+1. **Filter**: which nodes are eligible? (enough CPU/memory, taints match tolerations, affinity rules pass)
+2. **Score**: which eligible node is best? (most free resources, fewest pods of the same type)
 
-### Controller Manager — 幾十個 reconciliation loop
+The Scheduler only writes `nodeName`. It does not start any container.
 
-每個 controller 只負責一件事，邏輯模式都一樣：
+### Controller Manager — dozens of reconciliation loops
+
+Every controller follows the same pattern:
 
 ```go
 func reconcile() {
-    desired := 讀你宣告的狀態
-    actual  := 觀察現在的狀態
+    desired := read declared state from API Server
+    actual  := observe current state
     if desired != actual {
-        建立 / 刪除 / 更新 K8s 物件   // 不是直接跑 container，是操作物件
+        create / update / delete K8s objects  // never directly runs containers
     }
 }
 ```
 
-**複雜度靠組合，不靠單一 controller 變複雜：**
+**Complexity comes from composition, not from any single controller being complex:**
 
 ```
-你說：Deployment replicas=3
-  → Deployment Controller 建 ReplicaSet 物件
-  → ReplicaSet Controller 建 3 個 Pod 物件（只是 etcd 的資料）
-  → Scheduler 填 nodeName 欄位
-  → kubelet 叫 containerd 實際跑 container
-  → kubelet 打 readinessProbe → 寫 pod.status.ready = true
-  → Endpoint Controller 把 pod IP 加進 Service 的 endpoint 清單
-  → kube-proxy 更新 iptables
+You declare: Deployment replicas=3
+  → Deployment Controller creates a ReplicaSet object
+  → ReplicaSet Controller creates 3 Pod objects (just data in etcd, no container yet)
+  → Scheduler writes nodeName on each Pod
+  → kubelet on that node tells containerd to pull image and run container
+  → kubelet runs readinessProbe → writes pod.status.ready = true
+  → Endpoint Controller adds the pod IP to the Service's Endpoints object
+  → kube-proxy updates iptables rules on every node
 ```
 
-每層都很簡單，組合起來完成複雜的事。這是 K8s 架構最漂亮的地方（Separation of Concerns）。
+Each layer is simple. The combination delivers complex behavior. This is Separation of Concerns.
 
-### kubelet — node 上的管家
+### kubelet — the node-level agent
 
-kubelet 不是 K8s 裡面的 pod，是 node 上的 system daemon，比 K8s 本身更底層。
-
-```
-1. watch API Server：「有 nodeName=我、但還沒跑的 pod？」
-2. 叫 containerd（透過 CRI 介面）pull image、建 container、掛 volume
-3. 定期打 liveness / readiness probe
-   - liveness 失敗 → kill + restart container
-   - readiness 失敗 → pod status 改 not ready → Endpoint Controller 把它移出 Service
-4. 把 pod 狀態回寫 API Server
-```
-
-kubelet 是「API Server 世界」和「真實 container 世界」的唯一橋樑。
-
-### kube-proxy — 維護幻象 IP 的人
-
-名字叫 proxy，但它**不代理流量**，只是維護 iptables 規則。
+kubelet is a system daemon on every worker node, not a pod inside K8s. It is the bridge between the API Server world and real containers.
 
 ```
-你 curl http://10.96.140.94:80   ← ClusterIP，這台機器根本不存在
-
-封包到達 10.96.140.94
-→ kernel netfilter 攔截
-→ 查 iptables（由 kube-proxy 維護）
-→ DNAT 到真實 pod IP（10.244.0.23:8080）
-→ 封包到達 pod
+1. Watches API Server: "any pod with nodeName=me that I'm not running yet?"
+2. Calls containerd (via CRI) to pull image, create container, mount volumes
+3. Runs liveness and readiness probes on a schedule:
+   - liveness fails  → kill + restart the container
+   - readiness fails → set pod status to not-ready
+                       → Endpoint Controller removes pod from Service
+4. Writes pod status back to API Server
 ```
 
-kube-proxy watch Endpoint 變化，同步更新每個 node 上的 iptables。pod 加入或移除時，規則即時更新，這就是 Service 「load balancing」的真相。
+### kube-proxy — the iptables rules manager
+
+Despite the name, kube-proxy does **not** proxy traffic. It watches Service and Endpoint changes and updates iptables rules on each node.
+
+```
+curl http://10.96.140.94:80   ← ClusterIP — this machine does not exist
+
+What actually happens:
+  packet arrives at 10.96.140.94
+  → kernel netfilter intercepts
+  → looks up iptables (maintained by kube-proxy)
+  → DNAT to a real pod IP: 10.244.0.23:8080
+  → packet reaches the pod
+```
+
+When a pod is added or removed, kube-proxy immediately updates the iptables rules across all nodes. This is how Service load balancing actually works.
 
 ---
 
-## etcd Quorum — 為什麼要 3 或 5 個節點
+## etcd Quorum — Why 3 or 5 Nodes
 
-etcd 用 **Raft 共識演算法**，核心規則：
+etcd uses the **Raft consensus algorithm**. The core rule:
 
-> **任何寫入，必須超過半數節點確認，才算成功。**
+> **Any write must be acknowledged by more than half the nodes before it is committed.**
 
-| 節點數 | 需確認數 | 可承受故障 | 備註 |
+| Nodes | Quorum needed | Can tolerate | Notes |
 |---|---|---|---|
-| 1 | 1 | 0 | 單點故障 |
-| 2 | 2 | 0 | 跟 1 個一樣爛，但貴一倍 |
-| **3** | **2** | **1** | 最低 HA 配置 |
-| **5** | **3** | **2** | 生產推薦 |
+| 1 | 1 | 0 | Single point of failure |
+| 2 | 2 | 0 | Same as 1 node, costs twice as much |
+| **3** | **2** | **1** | Minimum HA configuration |
+| **5** | **3** | **2** | Recommended for production |
 
-**為什麼一定是奇數？** 偶數節點會遇到 split-brain：
-
-```
-4 個節點，網路斷開分兩組：
-  A 組（2 個）：「我們有 quorum！」
-  B 組（2 個）：「不，我們才有！」
-  → 兩組都湊不到 3/4，全部卡死
-
-3 個節點，網路斷開分兩組：
-  A 組（2 個）：「我們有 2/3 quorum，繼續服務」  ✓
-  B 組（1 個）：「我只有 1/3，我等待」
-  → 只有一組能繼續，不會腦裂
-```
-
-寫入流程：
+**Why always odd numbers?** Even-node clusters can split-brain:
 
 ```
-你 kubectl apply → API Server → etcd leader
-                                  ↓ 複製給 follower-1（確認）
-                                  ↓ 複製給 follower-2（確認）
-                               2/3 確認 → 寫入成功 → 回傳 API Server
+4 nodes, network partitions into two groups:
+  Group A (2 nodes): "We have quorum!"
+  Group B (2 nodes): "No, we have quorum!"
+  → Neither group reaches 3/4, both stall
+
+3 nodes, same partition:
+  Group A (2 nodes): "We have 2/3, we continue serving"  ✓
+  Group B (1 node):  "I only have 1/3, I wait"
+  → Only one group can proceed, no split-brain
+```
+
+Write flow:
+```
+kubectl apply → API Server → etcd leader
+                               ↓ replicates to follower-1 (ack)
+                               ↓ replicates to follower-2 (ack)
+                            2/3 acks → write committed → response to API Server
 ```
 
 ---
 
-## Docker Compose → Kubernetes 概念對照
+## Docker Compose → Kubernetes Mapping
 
-| Docker Compose | Kubernetes | 關鍵差異 |
+| Docker Compose | Kubernetes | Key difference |
 |---|---|---|
-| `image` + 手動 scale | `Deployment` + HPA | K8s 持續 reconcile，自動修正 |
-| `healthcheck`（一個） | `livenessProbe` + `readinessProbe` | 語意不同：一個重啟，一個拔流量 |
-| Container 名稱 DNS | `Service` 名稱 DNS | 必須建 Service 才有 DNS + LB |
-| Named volumes | `PersistentVolumeClaim` | PVC 生命週期獨立於 pod |
-| `restart: unless-stopped` | Controller reconciliation loop | K8s 不只重啟，還管排程、資源、健康 |
-| `environment:` 寫死 | `ConfigMap` + `Secret` | Secret 有獨立 RBAC 和稽核 |
-| nginx upstream | `Service` (kube-proxy/iptables) | 平台內建，不需要額外 proxy |
-| 沒有 | `HorizontalPodAutoscaler` | 根據 CPU/memory 自動調整 replica 數 |
-| `docker compose up` | `kubectl apply -f k8s/` | 宣告式：K8s 算 diff，你不用管順序 |
+| `image` + manual `scale` | `Deployment` + HPA | K8s continuously reconciles; auto-corrects drift |
+| Single `healthcheck` | `livenessProbe` + `readinessProbe` | Different semantics: one restarts, one removes from traffic |
+| Container name DNS | `Service` name DNS | Must create a Service to get DNS + load balancing |
+| Named volumes | `PersistentVolumeClaim` | PVC lifecycle is independent of pod lifecycle |
+| `restart: unless-stopped` | Controller reconciliation loop | K8s does more than restart: schedules, resources, health |
+| `environment:` inline | `ConfigMap` + `Secret` | Secrets have separate RBAC and audit trail |
+| nginx upstream | `Service` (kube-proxy/iptables) | Built into the platform; no extra proxy needed |
+| No autoscaling | `HorizontalPodAutoscaler` | Adjusts replica count automatically based on metrics |
+| `docker compose up` | `kubectl apply -f k8s/` | Declarative: K8s computes the diff, you don't manage order |
 
 ---
 
 ## livenessProbe vs readinessProbe
 
-這是 K8s 面試最常考的概念之一。
+The most commonly tested K8s interview concept.
 
 ```
-/healthz  →  livenessProbe   →  失敗 → kubelet kill + restart pod
-/ready    →  readinessProbe  →  失敗 → 從 Service endpoint 移除（不重啟）
+/healthz  →  livenessProbe   →  fail → kubelet kills and restarts the pod
+/ready    →  readinessProbe  →  fail → pod removed from Service endpoints (no restart)
 ```
 
-**鐵則：liveness 絕對不能 check 外部依賴（DB、Redis）。**
+**Rule: never check external dependencies (DB, Redis) in liveness.**
 
-如果 DB 掛掉：
-- liveness check DB 失敗 → 所有 pod 同時重啟 → 造成 thundering herd → DB 更難恢復
-- readiness check DB 失敗 → pod 暫時下線，不重啟，等 DB 恢復後自動重新加入 ✓
+If the DB goes down:
+- liveness checks DB → all pods restart simultaneously → thundering herd on DB reconnect → DB takes longer to recover
+- readiness checks DB → pods temporarily stop receiving traffic, no restarts, rejoin automatically when DB recovers ✓
 
 ```
-Pod 生命週期：
-  啟動 → readiness 失敗（不在 Service）→ DB 連線成功 → readiness 過 → 開始收流量
-                                        ↕
-                     liveness 失敗 → kubelet restart（只在 deadlock 等情況）
+Pod lifecycle:
+  start → readiness fails (not in Service) → DB connects → readiness passes → traffic begins
+                                            ↕
+                         liveness fails → kubelet restart (deadlock, unrecoverable crash)
 ```
 
 ---
 
 ## Zero-downtime Rolling Update
 
-三個機制缺一不可：
+Three mechanisms are all required:
 
 ```
-Rolling Update 一個 pod 的完整流程：
+Rolling update sequence for one pod:
 
-1. 建立新 pod（暫時有 4 個）
-2. 新 pod 的 readinessProbe 開始打 /ready
-3. /ready 通過 → 加進 Service endpoint → 開始收流量
-4. K8s 對舊 pod 送 SIGTERM
-5. preStop hook：sleep 5s（等 iptables 規則在所有 node 更新完）
-6. Go server 收到 SIGTERM → 關 listener → 等 in-flight request 跑完 → 退出
-7. 舊 pod 真正死亡，縮回 3 個
+1. New pod created (temporarily 4 pods)
+2. readinessProbe starts hitting /ready on the new pod
+3. /ready passes → pod added to Service endpoints → starts receiving traffic
+4. K8s sends SIGTERM to one old pod
+5. preStop hook: sleep 5s (wait for iptables rules to propagate to all nodes)
+6. Go server receives SIGTERM → stops accepting new connections
+   → drains in-flight requests → exits
+7. Old pod is gone, back to 3 pods
 ```
 
-**preStop 的必要性（常被忽略的坑）：**
+**Why preStop sleep is necessary (commonly overlooked):**
 
 ```
-K8s 把 pod 從 endpoint 移除
+K8s removes pod from Endpoints object
   ↓
-kube-proxy 還沒更新所有 node 的 iptables（需要幾秒傳播）
-  ↓ 沒有 preStop 的話
-舊 pod 同時收到 SIGTERM 開始關閉
+kube-proxy has not yet updated iptables on all nodes (takes a few seconds to propagate)
+  ↓  without preStop
+Pod receives SIGTERM and starts shutting down simultaneously
   ↓
-這幾秒內仍有 request 打到這個 pod → 502
+For those few seconds, requests still arrive at the closing pod → 502
 ```
 
 ```yaml
-# api-deployment.yaml 的三個保護機制
+# Three protections in api-deployment.yaml
 strategy:
   rollingUpdate:
-    maxUnavailable: 0   # 舊 pod 不先砍，容量不縮水
-    maxSurge: 1         # 最多多一個新 pod
+    maxUnavailable: 0  # never reduce healthy pod count during rollout
+    maxSurge: 1        # allow one extra pod during transition
 
 lifecycle:
   preStop:
     exec:
-      command: ["sleep", "5"]   # 等 iptables 傳播
+      command: ["sleep", "5"]  # wait for iptables propagation
 
-# readinessProbe 確保新 pod ready 才收流量
-# terminationGracePeriodSeconds: 30 確保 in-flight request 跑完
+# readinessProbe ensures new pod only gets traffic when ready
+# terminationGracePeriodSeconds: 30 ensures in-flight requests complete
 ```
 
-**壞版本部署的自然防護：**
-新 pod image 不存在或 crash → 永遠過不了 readiness → 永遠不加進 endpoint → 舊 pod 不會被砍 → 部署自動卡住，不影響線上服務。用 `kubectl rollout undo` 回滾。
+**Built-in protection against bad deploys:**
+New pod with a broken image or crashing app never passes readiness → never added to endpoints → old pods are never terminated → deploy stalls without affecting live traffic. Run `kubectl rollout undo` to revert.
 
 ---
 
-## HPA — 自動水平擴縮
+## HPA — Horizontal Pod Autoscaler
 
 ```
-HPA controller（每 15 秒跑一次）：
+HPA controller runs every 15 seconds:
   desired_replicas = ceil(current_replicas × current_avg_cpu / target_cpu)
 
-例：3 pods，各 request 100m CPU，實際用 90m → 90% utilization，target 60%
-desired = ceil(3 × 90/60) = ceil(4.5) = 5 pods → 自動加到 5
+Example: 3 pods, each requesting 100m CPU, currently using 90m → 90% utilization, target 60%
+desired = ceil(3 × 90/60) = ceil(4.5) = 5 pods → automatically scales up to 5
 ```
 
-**必要條件**：pod 一定要設 `resources.requests.cpu`。HPA 用 usage/request 算百分比，沒有 request 就無法計算，HPA 會一直顯示 `<unknown>`。
+**Required**: pods must have `resources.requests.cpu` set. HPA calculates utilization as usage/request. Without requests, metrics-server cannot compute utilization and HPA stays at `<unknown>`.
 
-Scale-down 有 300s stabilization window 防止抖動；scale-up 立即反應。
+Scale-down has a 300s stabilization window to prevent flapping. Scale-up reacts immediately.
+
+**Note for kind**: metrics-server requires `--kubelet-insecure-tls` to work:
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+kubectl patch -n kube-system deployment metrics-server --type=json \
+  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+```
 
 ---
 
@@ -337,57 +346,36 @@ Scale-down 有 300s stabilization window 防止抖動；scale-up 立即反應。
 
 | | Deployment | StatefulSet |
 |---|---|---|
-| Pod 名稱 | 隨機（`api-7d6f5-abc`） | 穩定有序（`postgres-0`, `postgres-1`） |
-| DNS | 只透過 Service | `pod-N.service.namespace.svc.cluster.local` |
-| Scaling | 並行 | 有序（0→1→2 up，2→1→0 down） |
-| Storage | 共用 PVC 或 emptyDir | 每個 pod 一個獨立 PVC（volumeClaimTemplates） |
-| 適合 | 無狀態 app | 資料庫、Kafka broker |
+| Pod names | Random (`api-7d6f5-abc`) | Stable, ordered (`postgres-0`, `postgres-1`) |
+| DNS | Via Service only | `pod-N.service.namespace.svc.cluster.local` |
+| Scaling | Parallel | Ordered (0→1→2 up, 2→1→0 down) |
+| Storage | Shared PVC or emptyDir | One PVC **per pod** via `volumeClaimTemplates` |
+| Use for | Stateless apps | Databases, brokers (Postgres, Redpanda) |
 
-Postgres 和 Redpanda 用 StatefulSet 的原因：
-- 需要穩定網路身份（Redpanda broker 要公告自己的地址）
-- 重新排程到其他 node 時，必須接回同一份資料
-
----
-
-## Redpanda v26 踩坑
-
-**坑 1：`command:` vs `args:` 語意不同**
-
-| | Docker Compose | Kubernetes |
-|---|---|---|
-| `command:` | 覆蓋 CMD，保留 ENTRYPOINT | 覆蓋 ENTRYPOINT（繞過 /entrypoint.sh） |
-| `args:` | — | 覆蓋 CMD，保留 ENTRYPOINT |
-
-Redpanda image 的 ENTRYPOINT 是 `/entrypoint.sh`，它把 `redpanda start <args>` 轉換成 `rpk redpanda start <args>`。K8s 用 `command:` 會繞過它，導致旗標解析失敗。**解法：K8s 用 `args:`。**
-
-**坑 2：`--check=false` 在 v26 移除**
-
-改用 `--mode dev-container`，它內建：
-- `--overprovisioned`
-- `--reserve-memory 0M`
-- `--check=false`
-- auto topic creation
+Postgres and Redpanda use StatefulSet because:
+- They need **stable network identity** — Redpanda advertises its broker address, which must remain constant.
+- They need **per-pod persistent storage** — rescheduling to another node must reconnect to the same data.
 
 ---
 
-## Worker scaling 與 partition 對應
+## Worker Scaling and Partition Assignment
 
 ```
-topic: track.uploads（1 個 partition）
+topic: track.uploads (1 partition)
 consumer group: upload-workers
 
-replicas=1 → consumer-0 擁有 partition-0  ✓
-replicas=2 → consumer-0 擁有 partition-0，consumer-1 閒置  ✗
+replicas=1 → consumer-0 owns partition-0  ✓
+replicas=2 → consumer-0 owns partition-0, consumer-1 is idle  ✗ (wasted)
 ```
 
-**規則**：最多有效 worker replicas = topic 的 partition 數。要橫向擴展 worker，先增加 partition：
+**Rule**: max useful worker replicas = number of topic partitions. To scale workers horizontally, first increase partitions:
 
 ```bash
 rpk topic alter-config track.uploads --set num.partitions=3
-# 然後把 worker Deployment 的 replicas 改成 3
+# then set worker Deployment replicas to 3
 ```
 
-Worker 用 `strategy: Recreate`（不用 RollingUpdate），因為單 partition 時若同時有新舊兩個 consumer，會觸發 rebalance，造成短暫停止消費。
+Worker uses `strategy: Recreate` instead of RollingUpdate because with 1 partition, a rolling update briefly creates two consumers in the same group, triggering a rebalance and causing a short consumption pause. Recreate stops the old pod before starting the new one.
 
 ---
 
@@ -395,127 +383,147 @@ Worker 用 `strategy: Recreate`（不用 RollingUpdate），因為單 partition 
 
 | | ConfigMap | Secret |
 |---|---|---|
-| 存什麼 | 非敏感設定 | 密碼、token、TLS cert |
-| 編碼 | 明文 | base64（不是加密！） |
-| 生產建議 | 正常使用 | Vault / Sealed Secrets / ESO |
+| Stores | Non-sensitive config | Passwords, tokens, TLS certs |
+| Encoding | Plaintext | base64 (not encryption) |
+| Production recommendation | Normal use | Vault / Sealed Secrets / External Secrets Operator |
 
-`stringData` 讓你寫明文，K8s apply 時自動 base64 encode。生產環境絕對不能把 Secret 的明文 commit 進 Git。
+`stringData` lets you write plaintext; K8s base64-encodes on apply. Never commit plaintext secret values to Git.
 
 ---
 
-## 從 kubectl apply 到 pod 跑起來的完整流程
+## Redpanda v26 Gotchas
+
+**Gotcha 1: `command:` vs `args:` have different semantics**
+
+| | Docker Compose | Kubernetes |
+|---|---|---|
+| `command:` | Overrides CMD, keeps ENTRYPOINT | Overrides ENTRYPOINT (bypasses `/entrypoint.sh`) |
+| `args:` | — | Overrides CMD, keeps ENTRYPOINT |
+
+Redpanda's image ENTRYPOINT is `/entrypoint.sh`, which translates `redpanda start <args>` into `rpk redpanda start <args>`. Using K8s `command:` bypasses the script, causing flag parsing to fail. **Fix: use `args:` in K8s.**
+
+**Gotcha 2: `--check=false` removed in v26**
+
+Use `--mode dev-container` instead, which bundles:
+- `--overprovisioned`
+- `--reserve-memory 0M`
+- `--check=false`
+- auto topic creation enabled
+
+---
+
+## Complete Flow: kubectl apply → pod receives traffic
 
 ```
 kubectl apply -f api-deployment.yaml
     ↓
-1. API Server：驗證 YAML → 寫進 etcd
+1. API Server validates YAML, writes to etcd
 
-2. Deployment Controller 的 watch 觸發
-   → 建 3 個 Pod 物件（etcd 裡的資料，nodeName 空白）
+2. Deployment Controller watch fires
+   → creates 3 Pod objects (etcd data only, nodeName empty)
 
-3. Scheduler 的 watch 觸發
-   → Filter + Score 選 node
-   → 寫 nodeName = "worker-1"
+3. Scheduler watch fires
+   → filter + score nodes
+   → writes nodeName = "worker-1"
 
-4. worker-1 的 kubelet 的 watch 觸發
-   → containerd pull image
-   → 啟動 container
-   → 打 readinessProbe
-   → /ready 通過 → 寫 pod.status.ready = true
+4. kubelet on worker-1 watch fires
+   → calls containerd to pull image
+   → starts container
+   → runs readinessProbe
+   → /ready passes → writes pod.status.ready = true
 
-5. Endpoint Controller 的 watch 觸發
-   → 把新 pod IP 加進 Endpoints 物件
+5. Endpoint Controller watch fires
+   → adds new pod IP to Endpoints object
 
-6. kube-proxy 的 watch 觸發
-   → 更新這個 node 的 iptables DNAT 規則
+6. kube-proxy watch fires
+   → updates iptables DNAT rules on every node
 
-7. 第一個 request 打進來，流量正確到達 pod ✓
+7. First request arrives, correctly routed to pod ✓
 ```
 
-整個過程 5~10 秒，全靠 watch 事件驅動，沒有任何元件在輪詢。
+Entire sequence completes in 5–10 seconds, fully event-driven via watches. No component polls.
 
 ---
 
-## Phase 規劃
+## Phase Roadmap
 
-| Phase | 重點 | 關鍵概念 |
+| Phase | Focus | Key concepts |
 |---|---|---|
-| Phase 0 | 本地 monolith | REST API、PostgreSQL、MinIO |
-| Phase 1 | Load balancing + caching | nginx、Redis cache-aside、rate limiting |
-| Phase 2 | Async queues | Redpanda/Kafka、at-least-once、worker |
-| **Phase 3** | **Kubernetes** | **Deployment、StatefulSet、HPA、probe、rolling update** |
-| Phase 4 | Cloud（EKS/GKE） | Managed K8s、LoadBalancer、Blue-Green deploy |
-| Phase 5 | Observability | Prometheus、Grafana、distributed tracing |
-| Phase 6 | Canary deploy | 流量切分、自動 rollback（需要 Phase 5 的 metrics） |
+| Phase 0 | Local monolith | REST API, PostgreSQL, MinIO |
+| Phase 1 | Load balancing + caching | nginx, Redis cache-aside, rate limiting |
+| Phase 2 | Async queues | Redpanda/Kafka, at-least-once, worker |
+| **Phase 3** | **Kubernetes** | **Deployment, StatefulSet, HPA, probes, rolling update** |
+| Phase 4 | Cloud (EKS/GKE) | Managed K8s, LoadBalancer, Blue-Green deploy |
+| Phase 5 | Observability | Prometheus, Grafana, distributed tracing |
+| Phase 6 | Canary deploy | Traffic splitting, automated rollback (requires Phase 5 metrics) |
 
 ---
 
-## Local dev 指令
+## Local Dev Commands
 
 ```bash
-# 環境準備（只需第一次）
+# One-time setup
 brew install kind
-kind create cluster --name beatstream
+make k8s-cluster
 
-# 每次部署
-docker build -t beatstream-api:latest --target api .
-docker build -t beatstream-worker:latest --target worker .
-kind load docker-image beatstream-api:latest --name beatstream
-kind load docker-image beatstream-worker:latest --name beatstream
-kubectl apply -f k8s/namespace.yaml  # 先建 namespace
-kubectl apply -f k8s/
+# Each deploy cycle
+make k8s-load    # builds app images and loads into kind
+make k8s-deploy  # applies namespace first, then all manifests
 
-# 觀察
+# Observe
 kubectl -n beatstream get pods,hpa -w
 kubectl -n beatstream rollout status deployment/api
 
-# 測試
+# Smoke test
 kubectl -n beatstream port-forward svc/api 8080:80
 curl http://localhost:8080/healthz
+curl -X POST http://localhost:8080/v1/artists \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Daft Punk","bio":"French electronic duo"}'
 
 # Rolling update
 kubectl -n beatstream set image deployment/api api=beatstream-api:v2
 kubectl -n beatstream rollout status deployment/api
 kubectl -n beatstream rollout undo deployment/api  # rollback
 
-# 清理
-kind delete cluster --name beatstream
+# Teardown
+make k8s-delete
 ```
 
 ---
 
-## Interview questions
+## Interview Questions
 
-**Q: livenessProbe 和 readinessProbe 的差異？為什麼 liveness 不能 check DB？**
+**Q: What is the difference between livenessProbe and readinessProbe? Why should liveness never check the DB?**
 
-Liveness 失敗會觸發 pod restart；readiness 失敗只把 pod 從 Service endpoint 移除，不重啟。如果 liveness check DB，DB 掛掉時所有 pod 同時重啟，對 DB 造成 thundering herd，反而讓 DB 更難恢復。Readiness check DB 的話，pod 只是暫時不收流量，等 DB 恢復後自動重新加入。
+Liveness failure triggers a pod restart; readiness failure only removes the pod from Service endpoints without restarting. If liveness checks the DB and the DB goes down, all pods restart simultaneously — creating a thundering herd that makes DB recovery harder. Readiness checking the DB is safe: pods go temporarily offline and rejoin automatically once DB recovers.
 
-**Q: HPA 設定了但 pod 沒有在 scale，要 check 什麼？**
+**Q: HPA is configured but pods are not scaling. What would you check?**
 
-1. metrics-server 有沒有裝（`kubectl top pods` 能不能用）
-2. Pod 有沒有設 `resources.requests.cpu`（沒有的話 HPA 顯示 `<unknown>`）
-3. `kubectl describe hpa api -n beatstream` 看 Events，有沒有錯誤訊息
-4. 實際 CPU 使用率有沒有超過 target（`kubectl top pods -n beatstream`）
+1. Is metrics-server installed? (`kubectl top pods` — if it errors, metrics-server is missing)
+2. Do pods have `resources.requests.cpu` set? Without it, HPA shows `<unknown>` and cannot compute utilization.
+3. `kubectl describe hpa api -n beatstream` — check Events for errors.
+4. Is actual CPU usage above the target? (`kubectl top pods -n beatstream`)
 
-**Q: 為什麼 Postgres 要用 StatefulSet 而不是 Deployment？**
+**Q: Why use a StatefulSet for Postgres instead of a Deployment?**
 
-Deployment 的 pod 名稱隨機，重新排程後可能拿到不同的 PVC。StatefulSet 保證 pod 名稱穩定（`postgres-0`）、網路身份穩定（固定 DNS）、且 volumeClaimTemplates 確保每個 pod 永遠連回同一個 PVC，不管被排程到哪個 node。
+Deployments give pods random names and don't guarantee stable storage — on rescheduling, a pod might reconnect to a different PVC. StatefulSets give pods stable names (`postgres-0`) and stable DNS (`postgres-0.postgres.beatstream.svc.cluster.local`), and `volumeClaimTemplates` ensures each pod always reconnects to its own PVC regardless of which node it lands on.
 
-**Q: Rolling update 進行中發現 error rate 上升，怎麼辦？**
+**Q: A rolling update is in progress and error rates spike. How do you roll back?**
 
 ```bash
-kubectl -n beatstream rollout undo deployment/api
-# 或指定版本
-kubectl -n beatstream rollout history deployment/api
-kubectl -n beatstream rollout undo deployment/api --to-revision=2
+kubectl rollout undo deployment/api -n beatstream
+# or to a specific revision:
+kubectl rollout history deployment/api -n beatstream
+kubectl rollout undo deployment/api --to-revision=2 -n beatstream
 ```
 
-K8s 保留 revision history（預設 10 個），rollback 是秒級的。`maxUnavailable: 0` 確保更新期間舊 pod 不會先被砍，所以有足夠時間偵測到問題再 rollback。
+K8s keeps a revision history (default 10). Rollback is instant. `maxUnavailable: 0` ensures old pods are never removed until new ones are healthy, giving time to detect errors before all old pods are gone.
 
-**Q: etcd 為什麼要奇數個節點？**
+**Q: Why does etcd need an odd number of nodes?**
 
-etcd 用 Raft 演算法，寫入需要超過半數（quorum）確認。奇數節點下，網路分割只會讓一邊取得 quorum，防止 split-brain（兩邊都認為自己是 leader、各自接受寫入、導致資料分叉）。2 個節點的問題是需要 2/2 確認，死一台就沒有 quorum，跟 1 台一樣爛卻貴一倍。
+etcd uses Raft consensus: any write requires acknowledgment from more than half the nodes. With an even number, a network partition can split the cluster into two equal groups, neither of which can reach quorum — the system stalls entirely (split-brain). With an odd number, any partition always leaves one group with majority, so exactly one group can continue accepting writes.
 
-**Q: 一個 pod 從 kubectl apply 到能收 request，中間發生了什麼？**
+**Q: Walk me through what happens between `kubectl apply` and a pod receiving its first request.**
 
-① API Server 驗證寫進 etcd → ② Deployment Controller 建 Pod 物件 → ③ Scheduler 填 nodeName → ④ kubelet 叫 containerd 跑 container → ⑤ kubelet 打 readinessProbe 通過後寫 pod Ready → ⑥ Endpoint Controller 把 pod IP 加進 Endpoints → ⑦ kube-proxy 更新 iptables DNAT 規則 → ⑧ 流量到達 pod。全程靠 watch 事件驅動，約 5~10 秒。
+① API Server validates and writes to etcd → ② Deployment Controller creates Pod objects → ③ Scheduler writes `nodeName` → ④ kubelet calls containerd to run the container → ⑤ readinessProbe passes, kubelet writes `pod.status.ready = true` → ⑥ Endpoint Controller adds pod IP to Endpoints → ⑦ kube-proxy updates iptables DNAT rules → ⑧ traffic reaches the pod. All steps driven by watch events, no polling. ~5–10 seconds end to end.
