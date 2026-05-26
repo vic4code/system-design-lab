@@ -2,21 +2,25 @@
 @tailwind components;
 @tailwind utilities;
 
-body {
+html, body {
+  height: 100%;
   background-color: #121212;
   color: #fff;
 }
 
 @layer components {
   .btn-primary {
-    @apply bg-accent hover:bg-accent-hover text-black font-semibold px-4 py-2 rounded-full text-sm transition-colors cursor-pointer;
+    @apply bg-accent hover:bg-accent-hover text-black font-semibold px-6 py-2 rounded-full text-sm transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+  .btn-ghost {
+    @apply text-muted hover:text-white transition-colors cursor-pointer;
   }
   .input {
-    @apply bg-surface-2 text-white rounded px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-accent placeholder-muted;
+    @apply bg-surface-2 text-white rounded px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-white placeholder-subdued w-full;
   }
 }
 
-/* Custom scrollbar */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #535353; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #737373; }
