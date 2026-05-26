@@ -42,6 +42,26 @@ func (h *Artists) Create(c *gin.Context) {
 	c.JSON(http.StatusCreated, a)
 }
 
+func (h *Artists) List(c *gin.Context) {
+	rows, err := h.db.Query(c.Request.Context(),
+		`SELECT id, name, created_at FROM artists ORDER BY name ASC LIMIT 100`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, apiError("failed to list artists"))
+		return
+	}
+	defer rows.Close()
+
+	artists := []artistRow{}
+	for rows.Next() {
+		var a artistRow
+		if err := rows.Scan(&a.ID, &a.Name, &a.CreatedAt); err != nil {
+			continue
+		}
+		artists = append(artists, a)
+	}
+	c.JSON(http.StatusOK, gin.H{"items": artists, "total": len(artists)})
+}
+
 func (h *Artists) Get(c *gin.Context) {
 	id := c.Param("id")
 	var a artistRow

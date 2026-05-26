@@ -21,12 +21,12 @@ import (
 
 type Tracks struct {
 	db       *pgxpool.Pool
-	store    *storage.MinIO
+	store    *storage.Storage
 	cache    *cache.Redis
 	producer queue.Publisher
 }
 
-func NewTracks(db *pgxpool.Pool, store *storage.MinIO, c *cache.Redis, p queue.Publisher) *Tracks {
+func NewTracks(db *pgxpool.Pool, store *storage.Storage, c *cache.Redis, p queue.Publisher) *Tracks {
 	return &Tracks{db: db, store: store, cache: c, producer: p}
 }
 
@@ -39,6 +39,28 @@ type trackRow struct {
 	PlayCount   int64     `json:"play_count"`
 	Status      string    `json:"status"`
 	CreatedAt   time.Time `json:"created_at"`
+}
+
+func (h *Tracks) List(c *gin.Context) {
+	rows, err := h.db.Query(c.Request.Context(),
+		`SELECT id, title, artist_id, duration_ms, release_date::TEXT, play_count, status, created_at
+		 FROM tracks ORDER BY created_at DESC LIMIT 50`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, apiError("failed to list tracks"))
+		return
+	}
+	defer rows.Close()
+
+	tracks := []trackRow{}
+	for rows.Next() {
+		var t trackRow
+		if err := rows.Scan(&t.ID, &t.Title, &t.ArtistID, &t.DurationMs,
+			&t.ReleaseDate, &t.PlayCount, &t.Status, &t.CreatedAt); err != nil {
+			continue
+		}
+		tracks = append(tracks, t)
+	}
+	c.JSON(http.StatusOK, gin.H{"items": tracks, "total": len(tracks)})
 }
 
 func (h *Tracks) Get(c *gin.Context) {

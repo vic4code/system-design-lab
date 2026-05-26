@@ -28,8 +28,14 @@ type AnalyticsWorker struct {
 	db       *pgxpool.Pool
 }
 
-func NewAnalyticsWorker(brokers string, db *pgxpool.Pool) (*AnalyticsWorker, error) {
-	c, err := queue.NewConsumer(brokers, "analytics-workers", TopicPlayEvents)
+func NewAnalyticsWorker(brokers, kafkaAuth, awsRegion string, db *pgxpool.Pool) (*AnalyticsWorker, error) {
+	var c *queue.Consumer
+	var err error
+	if kafkaAuth == "iam" {
+		c, err = queue.NewConsumerIAM(brokers, awsRegion, "analytics-workers", TopicPlayEvents)
+	} else {
+		c, err = queue.NewConsumer(brokers, "analytics-workers", TopicPlayEvents)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("analytics worker consumer: %w", err)
 	}

@@ -23,6 +23,26 @@ type playlistRow struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+func (h *Playlists) List(c *gin.Context) {
+	rows, err := h.db.Query(c.Request.Context(),
+		`SELECT id, name, created_at FROM playlists ORDER BY created_at DESC LIMIT 100`)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, apiError("failed to list playlists"))
+		return
+	}
+	defer rows.Close()
+
+	playlists := []playlistRow{}
+	for rows.Next() {
+		var p playlistRow
+		if err := rows.Scan(&p.ID, &p.Name, &p.CreatedAt); err != nil {
+			continue
+		}
+		playlists = append(playlists, p)
+	}
+	c.JSON(http.StatusOK, gin.H{"items": playlists, "total": len(playlists)})
+}
+
 func (h *Playlists) Get(c *gin.Context) {
 	id := c.Param("id")
 	if _, err := uuid.Parse(id); err != nil {
