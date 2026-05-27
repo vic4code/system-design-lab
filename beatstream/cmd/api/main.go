@@ -100,32 +100,44 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"status": "ready"})
 	})
 
+	jwtSecret := getEnv("JWT_SECRET", "dev-secret-change-in-production")
+
+	auth := handler.NewAuth(pool, jwtSecret)
 	artists := handler.NewArtists(pool)
 	tracks := handler.NewTracks(pool, store, rdb, producer)
 	playlists := handler.NewPlaylists(pool)
 	search := handler.NewSearch(pool, rdb)
 
+	requireAuth := middleware.RequireAuth(jwtSecret)
+
 	v1 := r.Group("/v1")
 	{
+		// Auth (public)
+		v1.POST("/auth/register", auth.Register)
+		v1.POST("/auth/login", auth.Login)
+		v1.GET("/auth/me", requireAuth, auth.Me)
+
+		// Artists (public)
 		v1.GET("/artists", artists.List)
-		v1.POST("/artists", artists.Create)
+		v1.POST("/artists", requireAuth, artists.Create)
 		v1.GET("/artists/:id", artists.Get)
 
+		// Tracks (read public, write protected)
 		v1.GET("/tracks", tracks.List)
-
 		v1.GET("/tracks/:id", tracks.Get)
-		v1.POST("/tracks", tracks.Create)
+		v1.POST("/tracks", requireAuth, tracks.Create)
 		v1.GET("/tracks/:id/stream",
 			middleware.StreamRateLimit(rdb.Client(), 100),
 			tracks.Stream,
 		)
 
+		// Playlists (read public, write protected)
 		v1.GET("/playlists", playlists.List)
 		v1.GET("/playlists/:id", playlists.Get)
-		v1.POST("/playlists", playlists.Create)
+		v1.POST("/playlists", requireAuth, playlists.Create)
 		v1.GET("/playlists/:id/tracks", playlists.ListTracks)
-		v1.POST("/playlists/:id/tracks", playlists.AddTrack)
-		v1.DELETE("/playlists/:id/tracks/:track_id", playlists.RemoveTrack)
+		v1.POST("/playlists/:id/tracks", requireAuth, playlists.AddTrack)
+		v1.DELETE("/playlists/:id/tracks/:track_id", requireAuth, playlists.RemoveTrack)
 
 		v1.GET("/search", search.Search)
 	}

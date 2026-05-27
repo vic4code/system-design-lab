@@ -35,6 +35,7 @@ func Migrate(pool *pgxpool.Pool) error {
 		migrationPlaylists,
 		migrationPlayEvents,
 		migrationTrackStatus,
+		migrationUsers,
 	}
 	for _, m := range migrations {
 		if _, err := pool.Exec(context.Background(), m); err != nil {
@@ -107,4 +108,16 @@ CREATE INDEX IF NOT EXISTS play_events_user_idx  ON play_events(user_id, played_
 // Default 'ready' keeps existing rows accessible without re-processing.
 const migrationTrackStatus = `
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ready';
+`
+
+const migrationUsers = `
+CREATE TABLE IF NOT EXISTS users (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email         TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    created_at    TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS users_email_idx ON users(email);
 `
