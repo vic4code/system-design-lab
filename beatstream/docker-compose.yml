@@ -3,8 +3,10 @@ services:
     image: nginx:alpine
     ports:
       - "80:80"
+      - "443:443"  # HTTPS — mkcert cert (run: make certs)
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro  # TLS certs (gitignored keys)
     depends_on:
       - api-1
       - api-2
@@ -26,6 +28,13 @@ services:
       KAFKA_BROKERS: redpanda:9092
       PORT: "8080"
       METRICS_PORT: "9090"
+      LOG_FORMAT: "json"
+      LOG_LEVEL: "info"
+      JWT_SECRET: "dev-secret-change-in-production"
+      ALLOWED_ORIGINS: "http://localhost:3000,http://localhost:3001,https://localhost"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      OTEL_SERVICE_NAME: "beatstream-api"
+      APP_ENV: "development"
     depends_on:
       postgres:
         condition: service_healthy
@@ -52,6 +61,10 @@ services:
       KAFKA_BROKERS: redpanda:9092
       PORT: "8080"
       METRICS_PORT: "9090"
+      LOG_FORMAT: "json"
+      LOG_LEVEL: "info"
+      JWT_SECRET: "dev-secret-change-in-production"
+      ALLOWED_ORIGINS: "http://localhost:3000,http://localhost:3001,https://localhost"
     depends_on:
       postgres:
         condition: service_healthy
@@ -78,6 +91,10 @@ services:
       KAFKA_BROKERS: redpanda:9092
       PORT: "8080"
       METRICS_PORT: "9090"
+      LOG_FORMAT: "json"
+      LOG_LEVEL: "info"
+      JWT_SECRET: "dev-secret-change-in-production"
+      ALLOWED_ORIGINS: "http://localhost:3000,http://localhost:3001,https://localhost"
     depends_on:
       postgres:
         condition: service_healthy
@@ -166,6 +183,20 @@ services:
     ports:
       - "9000:9000"
       - "9001:9001"
+    restart: unless-stopped
+
+  # ── Jaeger — distributed tracing UI (OTel third pillar) ─────────────────────
+  # Traces: http://localhost:16686
+  # OTLP ingest (HTTP): http://localhost:4318
+  # Correlate with logs via trace_id field in zap JSON output
+  # AWS equivalent: AWS X-Ray (use ADOT sidecar collector in ECS)
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4318:4318"    # OTLP HTTP ingest
     restart: unless-stopped
 
   prometheus:

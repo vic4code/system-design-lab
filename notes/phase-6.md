@@ -1,208 +1,213 @@
-# Phase 6 — Cloud Deployment
+# Phase 6 — Security Foundations
 
-## Architecture
+> Status: **in progress** — PR open on `feat/security`
 
-```
-Internet
-  │
-  ▼
-CloudFront (PriceClass_200 — covers Asia + US + Europe)
-  ├── /audio/*  ──────────────────► S3 (OAC, 24h cache)
-  └── default   ──────────────────► ALB (no cache)
-                                      │
-                                      ▼
-                           ECS Fargate — api (2 tasks, private subnets)
-                              │              │               │
-                           Aurora         Redis          MSK Serverless
-                      (Serverless v2)  (t4g.micro)       (IAM auth)
-                              │
-                       ECS Fargate — worker (1 task)
-```
-
-**Region:** ap-northeast-1 (Tokyo) — closest AWS region to Taiwan (~5ms vs 200ms to us-east-1).
-
-**AZs:** ap-northeast-1a + ap-northeast-1c. Two AZs is the minimum for HA; three would survive one AZ + one partial failure but costs 50% more.
+Security is implemented in two layers — **local prototype** (this phase) and **Terraform** (Phase 8).
+Each local decision maps directly to a cloud resource.
 
 ---
 
-## Files added
+## What we built
 
-```
-beatstream/
-├── infra/terraform/
-│   ├── main.tf             provider, backend (S3 optional)
-│   ├── variables.tf        aws_region, environment, db_password
-│   ├── outputs.tf          ALB DNS, CloudFront domain, ECR URLs, MSK ARN
-│   ├── vpc.tf              VPC 10.0.0.0/16, 2 public + 2 private subnets, NAT
-│   ├── security_groups.tf  ALB, API, worker, RDS, Redis, MSK SGs
-│   ├── iam.tf              ECS execution role + task role (S3 + MSK permissions)
-│   ├── ecr.tf              Two ECR repos: beatstream/api, beatstream/worker
-│   ├── alb.tf              ALB + target group (:8080/health) + HTTP listener
-│   ├── ecs.tf              Cluster, task defs (API + worker), services + circuit breaker
-│   ├── rds.tf              Aurora PostgreSQL Serverless v2 (0.5–4 ACUs)
-│   ├── elasticache.tf      Redis cache.t4g.micro
-│   ├── s3.tf               Audio bucket + public-access-block + lifecycle
-│   ├── cloudfront.tf       CDN: OAC for S3, CachingDisabled for API
-│   ├── msk.tf              MSK Serverless + null_resource to fetch bootstrap brokers
-│   └── terraform.tfvars.example
+### 1. Structured Logging (Observability first)
+
+**Why first:** You can't debug, audit, or alert on security events if you can't read the logs.
+
+**Files:** `internal/logger/logger.go`, `internal/middleware/zap_logger.go`
+
+Replaced `gin.Logger()` with **zap** structured JSON logging.
+
+Every request log line:
+```json
+{
+  "level": "info",
+  "ts": "2026-05-27T14:00:00Z",
+  "service": "beatstream-api",
+  "msg": "request",
+  "status": 200,
+  "method": "GET",
+  "path": "/v1/tracks",
+  "latency_ms": 4,
+  "ip": "172.18.0.1",
+  "request_id": "abc-123",
+  "user_id": "uuid-here"
+}
 ```
 
-**Go changes:**
-```
-internal/storage/s3.go     rewrote: MinIO SDK → AWS SDK v2 (auto-detects local vs cloud)
-internal/queue/kafka.go    added NewProducerIAM / NewConsumerIAM for MSK IAM SASL
-internal/worker/upload.go  added kafkaAuth, awsRegion params
-internal/worker/analytics.go added kafkaAuth, awsRegion params
-cmd/api/main.go            new S3 env vars (S3_ENDPOINT/S3_BUCKET), KAFKA_AUTH support
-cmd/worker/main.go         KAFKA_AUTH=iam for MSK
-docker-compose.yml         MINIO_* → S3_* env vars
-```
+**AWS mapping:**
+- `LOG_FORMAT=json` in ECS task definition → CloudWatch Logs
+- CloudWatch Metric Filters on `status >= 500` → alarm → SNS → PagerDuty
+- CloudWatch Logs Insights: `stats avg(latency_ms) by bin(5m)` — no APM agent needed
 
 ---
 
-## Deployment sequence
+### 2. Audit Log Table
+
+**Files:** `internal/middleware/audit.go`, `db/migrations/006_audit_logs.sql`
+
+Every `POST / PUT / PATCH / DELETE` is recorded asynchronously after the handler:
+
+```
+audit_logs
+├── user_id       UUID (nullable — captures unauthenticated logins too)
+├── action        TEXT  e.g. "track.create", "auth.login", "playlist.track.add"
+├── resource_type TEXT  e.g. "track", "playlist"
+├── resource_id   UUID (nullable)
+├── ip_address    INET
+├── user_agent    TEXT
+├── status_code   SMALLINT
+├── request_id    TEXT
+└── created_at    TIMESTAMPTZ (indexed DESC)
+```
+
+**Design decisions:**
+- INSERT-only (no UPDATE/DELETE) — append-only audit trail
+- Async goroutine — adds 0ms to response latency
+- user_id nullable — captures failed logins and register calls
+- Indexed on (user_id), (created_at DESC), (action), (ip_address)
+
+**AWS mapping:**
+- This table is the *application-level* audit trail (business actions)
+- **CloudTrail** covers AWS API calls (IAM actions, S3 access, EC2 changes)
+- **ALB access logs → S3** covers all HTTP-level traffic
+- Together: complete audit coverage from AWS API → HTTP → application action
+
+**GDPR note:** IP addresses are personal data (GDPR Art. 4(1)).
+Auto-delete rows older than 90 days (scheduled job or pg_partman partition drop).
+
+---
+
+### 3. Security Headers (Defence in Depth)
+
+**File:** `internal/middleware/security_headers.go`
+
+Applied at **both** nginx and Go middleware layers — if one misconfigures, the other still applies.
+
+| Header | Value | Protects against |
+|---|---|---|
+| `X-Content-Type-Options` | `nosniff` | MIME sniffing attacks |
+| `X-Frame-Options` | `DENY` | Clickjacking |
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | Protocol downgrade, cookie hijacking |
+| `Content-Security-Policy` | `default-src 'self'; frame-ancestors 'none'` | XSS, data injection |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | Referer leakage |
+| `Permissions-Policy` | `camera=(), microphone=(), geolocation=()` | Browser feature abuse |
+
+**CORS hardened:**
+- Old: `Access-Control-Allow-Origin: *` (wildcard)
+- New: origin-allowlist from `ALLOWED_ORIGINS` env var
+- Dev: allow any `localhost`; production: only the exact frontend domain
+
+**AWS mapping:**
+- **WAF on ALB** (OWASP Core Rule Set) — blocks SQLi, XSS, path traversal at the edge
+- **CloudFront** passes security headers through to the browser
+
+---
+
+### 4. Login Brute-Force Rate Limiting
+
+**File:** `internal/middleware/ratelimit.go` → `LoginRateLimit()`
+
+Strategy: sliding window counter in Redis.
+
+```
+Key:    ratelimit:login:<ip>
+Limit:  5 attempts per 15 minutes per IP
+On hit: 429 Too Many Requests + Retry-After header
+On Redis failure: fail open (don't block legitimate users)
+```
+
+Example 429 response:
+```json
+{
+  "error": "too many login attempts — try again later",
+  "retry_after": 847
+}
+```
+
+**AWS mapping:**
+- **WAF rate-based rule** on ALB: 100 requests / 5 min per IP on `/v1/auth/*`
+- WAF fires at the edge (before hitting ECS); application-level limit is the last defence
+- **GuardDuty** detects credential stuffing patterns across multiple accounts
+
+---
+
+### 5. TLS in Transit
+
+**Files:** `nginx/nginx.conf`, `nginx/certs/`
 
 ```bash
-# 1. Copy and fill in the vars file
-cp infra/terraform/terraform.tfvars.example infra/terraform/terraform.tfvars
-# edit terraform.tfvars: set db_password to something strong
-
-# 2. Initialise Terraform
-make infra-init
-
-# 3. Preview (check costs before applying)
-make infra-plan
-
-# 4. Create the stack (~15 min — MSK Serverless is the bottleneck)
-make infra-apply
-# After apply: null_resource auto-fetches MSK bootstrap brokers → SSM
-
-# 5. Build images and push to ECR
-make infra-push
-
-# 6. Force ECS to pull new images
-make infra-deploy
-
-# 7. Check it works
-curl http://$(cd infra/terraform && terraform output -raw alb_dns)/healthz
-# → {"status":"ok"}
+# One-time setup (requires: brew install mkcert)
+make certs       # Generate cert + key
+make certs-trust # Trust CA in system keychain (optional, needs sudo)
 ```
 
----
+Config:
+- HTTP (80) → HTTPS (443) permanent redirect (301)
+- TLS 1.2+ only (disables TLS 1.0/1.1 per PCI-DSS)
+- Strong cipher suite: ECDHE + AES-GCM / ChaCha20
+- Session tickets disabled (forward secrecy)
+- `server_tokens off` — hides nginx version from error pages
 
-## Key design decisions
-
-### ECS Fargate vs EKS
-
-| | ECS Fargate | EKS |
-|---|---|---|
-| Control plane | Fully managed (no cost) | $0.10/hr per cluster = ~$73/mo |
-| Ops overhead | Low — no node management | High — node groups, upgrades |
-| K8s ecosystem | No (use AWS native) | Full kubectl/Helm/CRD support |
-| Portability | AWS-only | Can migrate to any K8s |
-| Auto-scaling | Service Auto Scaling + ALB | HPA + KEDA + Cluster Autoscaler |
-| Best for | Single cloud, smaller teams | Multi-cloud, large platform teams |
-
-**Why ECS for Phase 4:** We already learned K8s in Phase 3. ECS tests whether you can navigate the AWS-native approach and explain the trade-offs in an interview.
-
-### Aurora Serverless v2 vs RDS PostgreSQL
-
-| | Aurora Serverless v2 | RDS PostgreSQL |
-|---|---|---|
-| Scaling | Auto (0.5–128 ACUs, ~seconds) | Manual (instance resize = downtime) |
-| Cost at idle | ~$0.10/hr (0.5 ACU) | ~$0.017/hr (t3.micro) |
-| Cost at peak | Higher per-unit than provisioned | Predictable |
-| Cold start | ~1s lag when scaling from minimum | None |
-| HA | Multi-AZ by default | Multi-AZ costs 2x |
-
-**When to choose Aurora:** Spiky or unpredictable workloads where you want automatic scaling without pre-provisioning. Good default for a dev environment.
-
-### CloudFront OAC vs direct S3
-
-Without CloudFront:
-- User in Taiwan → S3 ap-northeast-1: ~5ms (same region, fast)
-- User in Europe → S3 ap-northeast-1: ~180ms (cross-region)
-
-With CloudFront (PriceClass_200 includes Europe, Asia):
-- User in Europe → Frankfurt PoP: ~2ms after cache fill
-- Cache hit rate for popular tracks: ~95%+ (immutable files)
-
-The real win: **bandwidth cost**. CloudFront → origin (S3) data transfer is $0.06/GB. S3 → internet is $0.09/GB. For 1TB/month, CloudFront saves ~$30 AND is faster. For audio streaming at scale the math heavily favours CDN.
-
-### MSK Serverless IAM auth
-
-MSK Serverless only supports SASL/IAM — no plaintext, no SCRAM. The franz-go SASL AWS package handles the OAUTHBEARER token flow using SigV4 signing.
-
-Key insight: the ECS task role credentials are injected via the [ECS credential provider](https://docs.aws.amazon.com/sdkref/latest/guide/feature-container-credentials.html). The container never handles actual AWS keys — the ECS agent rotates temporary credentials automatically.
+**AWS mapping:**
+- **ACM** (AWS Certificate Manager): free TLS cert, auto-renews, no private key handling
+- **ALB HTTPS listener** (port 443): terminates TLS, forwards plain HTTP to ECS on port 8080
+- Inside VPC: ECS→RDS, ECS→Redis use TLS with `sslmode=require`
+- **KMS** manages keys for RDS, S3 (SSE-KMS), ElastiCache encryption at rest
 
 ---
 
-## Cost estimate (10K DAU, ap-northeast-1)
+### 6. Secrets Pattern
 
-| Service | Size | ~Monthly |
-|---|---|---|
-| ECS Fargate API (2 tasks × 0.5 vCPU, 1GB) | 730 hr/mo | $18 |
-| ECS Fargate Worker (1 task × 0.25 vCPU) | 730 hr/mo | $4 |
-| Aurora Serverless v2 (avg 1 ACU) | | $50 |
-| ElastiCache t4g.micro | | $12 |
-| MSK Serverless (low volume) | ~$0.011/hr base | $8 |
-| ALB | | $20 |
-| NAT Gateway | | $35 |
-| CloudFront (100GB/mo) | | $9 |
-| S3 (50GB audio) | | $1 |
-| **Total** | | **~$157/mo** |
+**Current (dev):** environment variables in `docker-compose.yml`
 
-NAT Gateway is surprisingly expensive (~$0.045/GB data processed + $32/mo fixed). For a production system: use S3/ECR VPC endpoints to avoid routing S3 and ECR traffic through NAT (~40% of NAT cost at scale).
-
----
-
-## Simulating AZ failure
-
-```bash
-# Find tasks in AZ-a
-aws ecs list-tasks --cluster beatstream --query taskArns
-
-# Stop all tasks (ECS will restart them; ALB drains connections first)
-# In practice: terminate EC2 instances in AZ-a, or use AWS Fault Injection Simulator
-
-# Watch ALB route around the failure — should see 0 errors
-k6 run k6/load.js &
-aws ecs update-service --cluster beatstream --service beatstream-api \
-  --placement-constraints '[{"type":"memberOf","expression":"attribute:ecs.availability-zone != ap-northeast-1a"}]'
+**What NOT to do (and why):**
+```yaml
+# Bad: hardcoded secrets in source code
+environment:
+  JWT_SECRET: "my-super-secret-key"  # visible in git history forever
+  DB_PASSWORD: "password123"          # exposed to anyone with repo access
 ```
 
-Expected: ALB detects unhealthy tasks (3 failed health checks × 30s = ~90s), drains connections, routes to healthy tasks. p99 latency spikes during failover but error rate stays 0% if connection draining works.
+**Pattern we follow (dev):** env vars from `.env` file (gitignored)
 
----
+**AWS mapping — AWS Secrets Manager:**
+```hcl
+# Terraform
+resource "aws_secretsmanager_secret" "jwt_secret" {
+  name                    = "beatstream/jwt-secret"
+  recovery_window_in_days = 7
+  kms_key_id             = aws_kms_key.secrets.arn  # Customer-managed KMS key
+}
 
-## Measuring real-world latency
-
-```bash
-# From Taiwan to ap-northeast-1 CloudFront
-for i in $(seq 10); do
-  curl -o /dev/null -s -w "%{time_total}\n" \
-    https://$(cd infra/terraform && terraform output -raw cloudfront_domain)/healthz
-done | awk '{s+=$1} END {print "p50:", s/NR}'
-
-# Compare: direct ALB (bypasses CDN)
-curl -o /dev/null -s -w "time: %{time_total}s\n" \
-  http://$(cd infra/terraform && terraform output -raw alb_dns)/healthz
+# ECS task definition — secret injected at container start
+secrets = [{
+  name      = "JWT_SECRET"
+  valueFrom = aws_secretsmanager_secret.jwt_secret.arn
+}]
 ```
 
-Typical results from Taiwan:
-- API (ALB, same region): ~5–15ms
-- Audio (CloudFront, cache hit): ~3–8ms
-- Audio (CloudFront, cache miss → S3): ~25–40ms
+Benefits over env vars:
+- Automatic rotation (Lambda hook)
+- Audit trail (CloudTrail: who read which secret, when)
+- KMS encryption at rest
+- IAM: task role has `GetSecretValue` only for its own secrets (least privilege)
+- Containers never see the actual value in `docker inspect`
 
 ---
 
-## Interview questions to answer before Phase 5
+## Interview answers
 
-> *"Walk me through your AWS architecture. Why did you choose ECS over EKS?"*
-> See design decisions above. Key points: no control plane cost, simpler ops, AWS-native integrations, sufficient for a team that isn't already running K8s at scale.
+> *"What's the difference between audit logs and CloudTrail?"*
+> CloudTrail records AWS API calls — who assumed an IAM role, who changed a security group, who accessed S3. It's infrastructure-level. Our `audit_logs` table records business actions — user X created playlist Y, user Z deleted their account. Both are needed: CloudTrail for infrastructure forensics, application audit logs for compliance and business logic.
 
-> *"What happens when an availability zone goes down?"*
-> ALB stops routing to unhealthy tasks (after 3 health check failures × 30s). ECS launches replacement tasks in the surviving AZ. RDS Aurora promotes a replica to writer (usually <30s). Redis is a single node in this setup — it would be unavailable until ECS brings up a replacement (cache miss fallback in the API). For production: use ElastiCache Replication Group with a replica in each AZ.
+> *"Why set security headers at both nginx AND the Go middleware?"*
+> Defence in depth. If nginx is bypassed (direct ALB → ECS on port 8080 during a misconfiguration), the Go middleware still applies. If someone swaps the Go middleware, nginx still protects. In production we also add a WAF third layer at the ALB.
 
-> *"Why is the NAT Gateway so expensive?"*
-> NAT charges $0.045/GB processed + $0.045/hr. ECS tasks pulling from ECR, writing to S3, and connecting to MSK all go through NAT. The fix: VPC endpoints for S3, ECR, and MSK so that traffic stays on the AWS backbone (free for gateway endpoints, fixed hourly rate for interface endpoints).
+> *"How does TLS work between your services?"*
+> Externally: ACM cert at ALB, TLS 1.2+, terminates at the load balancer. Inside the VPC: ECS→RDS uses `sslmode=require` (RDS enforces TLS). ECS→ElastiCache uses in-transit encryption. ECS→MSK uses SASL/TLS (IAM auth). The VPC private subnets ensure this traffic never touches the public internet.
+
+> *"How do you handle key rotation?"*
+> JWT: rotate `JWT_SECRET` in Secrets Manager → update ECS task definition → force new deployment → old tokens expire within 7 days automatically. DB password: Secrets Manager rotation with a Lambda function — no app restart needed if using connection pooling (PgBouncer/RDS Proxy handles credential refresh).
+
+> *"What's your GDPR plan for audit log data?"*
+> Audit log IP addresses are personal data. We auto-delete rows older than 90 days via a scheduled PostgreSQL job. In Phase 7 we add the GDPR erasure endpoint — when a user deletes their account, their `user_id` in `audit_logs` is set to NULL (ON DELETE SET NULL in the FK), preserving the security record without linking it to a real person.

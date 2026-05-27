@@ -2,6 +2,17 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useAuth } from "@/context/AuthContext";
+
+function LogOutIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="w-4 h-4">
+      <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+      <polyline points="16 17 21 12 16 7" />
+      <line x1="21" y1="12" x2="9" y2="12" />
+    </svg>
+  );
+}
 
 function HomeIcon({ filled }: { filled?: boolean }) {
   return filled ? (
@@ -60,6 +71,7 @@ const navItems = [
 
 export default function Sidebar() {
   const path = usePathname();
+  const { state, user, logout } = useAuth();
 
   return (
     <aside className="w-60 shrink-0 bg-black flex flex-col py-6 px-3 gap-2 overflow-y-auto">
@@ -93,6 +105,38 @@ export default function Sidebar() {
           );
         })}
       </nav>
+
+      {/* Bottom: user section */}
+      <div className="mt-auto pt-4 border-t border-white/10">
+        {state.status === "loading" ? null : state.status === "authenticated" ? (
+          <div className="flex items-center gap-3 px-3 py-2 rounded hover:bg-surface transition-colors group">
+            {/* Avatar */}
+            <div className="w-8 h-8 rounded-full bg-accent flex items-center justify-center text-black text-sm font-bold shrink-0 select-none">
+              {user!.name[0].toUpperCase()}
+            </div>
+            <p className="flex-1 text-sm font-semibold truncate">{user!.name}</p>
+            <button
+              onClick={logout}
+              className="opacity-0 group-hover:opacity-100 transition-opacity text-muted hover:text-white"
+              title="Log out"
+            >
+              <LogOutIcon />
+            </button>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-2 px-3">
+            <Link href="/login" className="btn-primary text-center py-2 text-sm">
+              Log in
+            </Link>
+            <Link
+              href="/register"
+              className="text-center py-2 text-sm text-muted hover:text-white transition-colors"
+            >
+              Sign up
+            </Link>
+          </div>
+        )}
+      </div>
     </aside>
   );
 }

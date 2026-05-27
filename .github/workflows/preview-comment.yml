@@ -3,6 +3,10 @@ name: Comment Vercel Preview URL on PR
 on:
   deployment_status:
 
+permissions:
+  pull-requests: write   # needed to post / delete PR comments
+  issues: write          # listComments + deleteComment use the issues API
+
 jobs:
   comment:
     if: |

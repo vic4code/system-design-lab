@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { createPlaylist, listPlaylists } from "@/lib/api";
 import type { Playlist } from "@/lib/api";
+import { useAuth } from "@/context/AuthContext";
 
 const CARD_COLORS = [
   "#e91429", "#e8115b", "#8d67ab", "#477d95",
@@ -11,6 +12,8 @@ const CARD_COLORS = [
 ];
 
 export default function PlaylistsPage() {
+  const { state } = useAuth();
+  const isAuthed = state.status === "authenticated";
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [newName, setNewName] = useState("");
   const [creating, setCreating] = useState(false);
@@ -42,16 +45,24 @@ export default function PlaylistsPage() {
       <div className="px-6 pt-14 pb-6">
         <div className="flex items-center justify-between mb-8">
           <h1 className="text-3xl font-bold">Your Library</h1>
-          <button
-            onClick={() => setShowForm((v) => !v)}
-            className="w-8 h-8 rounded-full bg-surface-2 hover:bg-surface-3 flex items-center justify-center text-muted hover:text-white transition-colors text-xl leading-none"
-            title="Create playlist"
-          >
-            +
-          </button>
+          {isAuthed && (
+            <button
+              onClick={() => setShowForm((v) => !v)}
+              className="w-8 h-8 rounded-full bg-surface-2 hover:bg-surface-3 flex items-center justify-center text-muted hover:text-white transition-colors text-xl leading-none"
+              title="Create playlist"
+            >
+              +
+            </button>
+          )}
         </div>
 
-        {showForm && (
+        {!isAuthed && state.status !== "loading" && (
+          <p className="text-sm text-muted mb-6">
+            <Link href="/login" className="text-white underline hover:text-accent">Log in</Link> to create and manage playlists.
+          </p>
+        )}
+
+        {isAuthed && showForm && (
           <form onSubmit={handleCreate} className="flex gap-3 mb-8 max-w-sm">
             <input
               autoFocus

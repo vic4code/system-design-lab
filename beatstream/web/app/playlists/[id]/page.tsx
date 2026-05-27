@@ -11,9 +11,12 @@ import {
 } from "@/lib/api";
 import type { Playlist, Track } from "@/lib/api";
 import TrackRow from "@/components/TrackRow";
+import { useAuth } from "@/context/AuthContext";
 
 export default function PlaylistDetailPage() {
   const { id } = useParams<{ id: string }>();
+  const { state } = useAuth();
+  const isAuthed = state.status === "authenticated";
   const [playlist, setPlaylist] = useState<Playlist | null>(null);
   const [tracks, setTracks] = useState<Track[]>([]);
   const [allTracks, setAllTracks] = useState<Track[]>([]);
@@ -83,13 +86,13 @@ export default function PlaylistDetailPage() {
               key={t.id}
               track={t}
               index={i + 1}
-              onRemove={() => handleRemove(t.id)}
+              onRemove={isAuthed ? () => handleRemove(t.id) : undefined}
             />
           ))}
         </div>
 
-        {/* Add track */}
-        {available.length > 0 && (
+        {/* Add track — only for authenticated users */}
+        {isAuthed && available.length > 0 && (
           <div className="flex gap-3 max-w-sm">
             <select
               value={addId}
