@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -68,6 +69,18 @@ func ZapLogger() gin.HandlerFunc {
 		}
 		if errMsg != "" {
 			fields = append(fields, zap.String("error", errMsg))
+		}
+
+		// Correlate log line with the OTel trace span.
+		// This is the "three pillars" correlation:
+		//   trace_id in logs → find the full trace in Jaeger / X-Ray
+		//   request_id in logs → find all log lines for this request
+		if span := trace.SpanFromContext(c.Request.Context()); span.SpanContext().IsValid() {
+			sc := span.SpanContext()
+			fields = append(fields,
+				zap.String("trace_id", sc.TraceID().String()),
+				zap.String("span_id", sc.SpanID().String()),
+			)
 		}
 
 		log.Log(level, "request", fields...)

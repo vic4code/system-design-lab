@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.uber.org/zap"
 
 	"github.com/vic4code/system-design-lab/beatstream/internal/cache"
@@ -19,6 +20,7 @@ import (
 	"github.com/vic4code/system-design-lab/beatstream/internal/middleware"
 	"github.com/vic4code/system-design-lab/beatstream/internal/queue"
 	"github.com/vic4code/system-design-lab/beatstream/internal/storage"
+	"github.com/vic4code/system-design-lab/beatstream/internal/telemetry"
 )
 
 func main() {
@@ -29,6 +31,25 @@ func main() {
 	defer applogger.Sync()
 
 	ctx := context.Background()
+
+	// ── OpenTelemetry tracing ──────────────────────────────────────────────────
+	// Third pillar of observability: Logs (zap) + Metrics (Prometheus) + Traces (OTel)
+	// OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318 (local) or ADOT sidecar (AWS)
+	// Traces flow: gin handler → child spans for DB/Redis → exported via OTLP
+	otelShutdown, err := telemetry.Init(ctx)
+	if err != nil {
+		log.Warn("OpenTelemetry init failed — tracing disabled", zap.Error(err))
+	} else {
+		defer otelShutdown(ctx)
+		log.Info("OpenTelemetry tracing enabled",
+			zap.String("endpoint", func() string {
+				if ep := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); ep != "" {
+					return ep
+				}
+				return "http://localhost:4318"
+			}()),
+		)
+	}
 
 	pool, err := db.Connect(mustEnv("DATABASE_URL"))
 	if err != nil {
@@ -93,13 +114,15 @@ func main() {
 	r := gin.New()
 
 	// Middleware stack (order matters):
-	// 1. Recovery    — catch panics, return 500
-	// 2. RequestID   — stamp X-Request-ID on every request
-	// 3. ZapLogger   — structured JSON request log (replaces gin.Logger)
-	// 4. SecurityHeaders — defensive HTTP headers + tightened CORS
-	// 5. PrometheusMetrics — Prometheus counters/histograms
+	// 1. Recovery         — catch panics, return 500
+	// 2. OtelGin          — create root OTel span per request (must be early)
+	// 3. RequestID        — stamp X-Request-ID (reuse OTel trace_id if available)
+	// 4. ZapLogger        — structured JSON log with trace_id + request_id correlation
+	// 5. SecurityHeaders  — defensive HTTP headers + CORS
+	// 6. PrometheusMetrics — Prometheus counters/histograms
 	r.Use(
 		gin.Recovery(),
+		otelgin.Middleware("beatstream-api"), // Creates root span; propagates W3C traceparent
 		middleware.RequestID(),
 		middleware.ZapLogger(),
 		middleware.SecurityHeaders(),
