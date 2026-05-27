@@ -1,6 +1,7 @@
 .PHONY: run build test migrate up down logs \
         k8s-cluster k8s-load k8s-deploy k8s-status k8s-delete \
         infra-init infra-plan infra-apply infra-push infra-deploy infra-destroy \
+        certs certs-trust \
         web-install web-dev
 
 # Start all services
@@ -123,6 +124,19 @@ infra-deploy:
 # Tear down everything (will NOT delete the S3 bucket if it has objects — drain first)
 infra-destroy:
 	cd $(TERRAFORM_DIR) && terraform destroy
+
+# ── Phase 6: Security ─────────────────────────────────────────────────────────
+
+# Generate local TLS certs using mkcert (run once; requires: brew install mkcert)
+# The .key file is gitignored; only the .crt is committed.
+certs:
+	@which mkcert > /dev/null || (echo "Install mkcert: brew install mkcert" && exit 1)
+	mkdir -p nginx/certs
+	cd nginx/certs && mkcert -cert-file localhost.crt -key-file localhost.key localhost 127.0.0.1
+
+# Trust the mkcert CA in the system keychain (run once, requires sudo)
+certs-trust:
+	mkcert -install
 
 # ── Frontend ───────────────────────────────────────────────────────────────────
 
