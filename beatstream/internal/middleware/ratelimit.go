@@ -44,6 +44,65 @@ else
 end
 `)
 
+// LoginRateLimit protects auth endpoints against brute-force attacks.
+// Strategy: sliding window counter in Redis.
+//   - Key:    ratelimit:login:<ip>
+//   - Window: 15 minutes
+//   - Limit:  5 attempts per window
+//   - On exceeded: 429 with Retry-After header
+//   - On Redis error: fail open (don't block legitimate users)
+//
+// AWS mapping: this logic is replicated at the ALB level via AWS WAF
+// (rate-based rule: 100 requests / 5 min per IP on /v1/auth/*).
+// The application-level limit is the last line of defence.
+func LoginRateLimit(rdb *redis.Client) gin.HandlerFunc {
+	const (
+		maxAttempts = 5
+		windowSecs  = 15 * 60 // 15 minutes
+	)
+
+	return func(c *gin.Context) {
+		ip := c.ClientIP()
+		key := fmt.Sprintf("ratelimit:login:%s", ip)
+		ctx := context.Background()
+
+		// Atomic increment + set expiry on first attempt
+		count, err := rdb.Incr(ctx, key).Result()
+		if err != nil {
+			// Redis unavailable — fail open
+			c.Next()
+			return
+		}
+		// Set expiry only on the first increment to implement sliding window
+		if count == 1 {
+			rdb.Expire(ctx, key, time.Duration(windowSecs)*time.Second)
+		}
+
+		c.Header("X-RateLimit-Limit", fmt.Sprintf("%d", maxAttempts))
+		c.Header("X-RateLimit-Remaining", fmt.Sprintf("%d", max(0, maxAttempts-int(count))))
+
+		if count > maxAttempts {
+			ttl, _ := rdb.TTL(ctx, key).Result()
+			c.Header("Retry-After", fmt.Sprintf("%d", int(ttl.Seconds())))
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"error":       "too many login attempts — try again later",
+				"retry_after": int(ttl.Seconds()),
+			})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // StreamRateLimit applies a token bucket rate limit to the stream endpoint.
 // Authenticated requests (X-User-ID header present) are exempt.
 // On Redis failure the middleware fails open so the service stays available.

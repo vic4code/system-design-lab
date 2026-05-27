@@ -36,3 +36,7 @@ Thumbs.db
 
 # k6
 k6_results/
+
+# TLS private keys — never commit to git
+# The cert (.crt) is safe to commit; the key (.key) is not.
+beatstream/nginx/certs/*.key

@@ -3,8 +3,10 @@ services:
     image: nginx:alpine
     ports:
       - "80:80"
+      - "443:443"  # HTTPS — mkcert cert (run: make certs)
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro  # TLS certs (gitignored keys)
     depends_on:
       - api-1
       - api-2
@@ -26,6 +28,10 @@ services:
       KAFKA_BROKERS: redpanda:9092
       PORT: "8080"
       METRICS_PORT: "9090"
+      LOG_FORMAT: "json"        # Structured JSON logs (CloudWatch-ready)
+      LOG_LEVEL: "info"
+      JWT_SECRET: "dev-secret-change-in-production"
+      ALLOWED_ORIGINS: "http://localhost:3000,http://localhost:3001,https://localhost"
     depends_on:
       postgres:
         condition: service_healthy
@@ -52,6 +58,10 @@ services:
       KAFKA_BROKERS: redpanda:9092
       PORT: "8080"
       METRICS_PORT: "9090"
+      LOG_FORMAT: "json"
+      LOG_LEVEL: "info"
+      JWT_SECRET: "dev-secret-change-in-production"
+      ALLOWED_ORIGINS: "http://localhost:3000,http://localhost:3001,https://localhost"
     depends_on:
       postgres:
         condition: service_healthy
@@ -78,6 +88,10 @@ services:
       KAFKA_BROKERS: redpanda:9092
       PORT: "8080"
       METRICS_PORT: "9090"
+      LOG_FORMAT: "json"
+      LOG_LEVEL: "info"
+      JWT_SECRET: "dev-secret-change-in-production"
+      ALLOWED_ORIGINS: "http://localhost:3000,http://localhost:3001,https://localhost"
     depends_on:
       postgres:
         condition: service_healthy

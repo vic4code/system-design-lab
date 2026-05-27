@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,34 +10,40 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/zap"
+
 	"github.com/vic4code/system-design-lab/beatstream/internal/cache"
 	"github.com/vic4code/system-design-lab/beatstream/internal/db"
 	"github.com/vic4code/system-design-lab/beatstream/internal/handler"
+	applogger "github.com/vic4code/system-design-lab/beatstream/internal/logger"
 	"github.com/vic4code/system-design-lab/beatstream/internal/middleware"
 	"github.com/vic4code/system-design-lab/beatstream/internal/queue"
 	"github.com/vic4code/system-design-lab/beatstream/internal/storage"
 )
 
 func main() {
+	// ── Structured logger ──────────────────────────────────────────────────────
+	// LOG_FORMAT=json → newline-delimited JSON (CloudWatch)
+	// LOG_FORMAT=console (default) → coloured human-readable (local dev)
+	log := applogger.Init()
+	defer applogger.Sync()
+
 	ctx := context.Background()
 
 	pool, err := db.Connect(mustEnv("DATABASE_URL"))
 	if err != nil {
-		log.Fatalf("db connect: %v", err)
+		log.Fatal("db connect", zap.Error(err))
 	}
 	defer pool.Close()
 
 	if err := db.Migrate(pool); err != nil {
-		log.Fatalf("db migrate: %v", err)
+		log.Fatal("db migrate", zap.Error(err))
 	}
 
-	// S3-compatible storage.
-	// Local dev: set S3_ENDPOINT=http://minio:9000 + S3_ACCESS_KEY/S3_SECRET_KEY.
-	// AWS ECS:   leave S3_ENDPOINT unset — the task role provides credentials.
-	// S3_PRESIGN_ENDPOINT: browser-accessible URL for pre-signed audio links.
-	//   In docker-compose set to http://localhost:9000 so browsers can reach MinIO.
-	// S3-compatible storage — optional. If S3_BUCKET is unset, upload and
-	// stream endpoints are disabled but all read endpoints remain functional.
+	// ── S3-compatible storage (optional) ───────────────────────────────────────
+	// Local dev: S3_ENDPOINT=http://minio:9000 + S3_ACCESS_KEY/S3_SECRET_KEY
+	// AWS ECS:   leave S3_ENDPOINT unset — ECS task role provides credentials
+	// S3_PRESIGN_ENDPOINT: browser-accessible URL for pre-signed audio links
 	var store *storage.Storage
 	if bucket := os.Getenv("S3_BUCKET"); bucket != "" {
 		store, err = storage.New(ctx, storage.Config{
@@ -50,24 +55,24 @@ func main() {
 			PresignEndpoint: os.Getenv("S3_PRESIGN_ENDPOINT"),
 		})
 		if err != nil {
-			log.Fatalf("storage init: %v", err)
+			log.Fatal("storage init", zap.Error(err))
 		}
 		if os.Getenv("S3_ENDPOINT") != "" {
 			if err := store.EnsureBucket(ctx); err != nil {
-				log.Fatalf("ensure bucket: %v", err)
+				log.Fatal("ensure bucket", zap.Error(err))
 			}
 		}
 	} else {
-		log.Println("S3_BUCKET not set — upload/stream disabled")
+		log.Info("S3_BUCKET not set — upload/stream disabled")
 	}
 
 	rdb, err := cache.NewRedis(mustEnv("REDIS_URL"))
 	if err != nil {
-		log.Fatalf("redis connect: %v", err)
+		log.Fatal("redis connect", zap.Error(err))
 	}
 
-	// Kafka producer — optional. If KAFKA_BROKERS is unset the upload
-	// pipeline is disabled but all read endpoints remain functional.
+	// ── Kafka producer (optional) ───────────────────────────────────────────────
+	// KAFKA_AUTH=iam → MSK SASL/IAM (production); unset → PLAINTEXT (local)
 	var producer *queue.Producer
 	if brokers := os.Getenv("KAFKA_BROKERS"); brokers != "" {
 		if os.Getenv("KAFKA_AUTH") == "iam" {
@@ -76,15 +81,30 @@ func main() {
 			producer, err = queue.NewProducer(brokers)
 		}
 		if err != nil {
-			log.Fatalf("kafka producer: %v", err)
+			log.Fatal("kafka producer", zap.Error(err))
 		}
 		defer producer.Close()
 	} else {
-		log.Println("KAFKA_BROKERS not set — upload pipeline disabled")
+		log.Info("KAFKA_BROKERS not set — upload pipeline disabled")
 	}
 
+	// ── Gin engine ─────────────────────────────────────────────────────────────
+	gin.SetMode(getEnv("GIN_MODE", "debug"))
 	r := gin.New()
-	r.Use(gin.Logger(), gin.Recovery(), middleware.CORS(), middleware.RequestID(), middleware.PrometheusMetrics())
+
+	// Middleware stack (order matters):
+	// 1. Recovery    — catch panics, return 500
+	// 2. RequestID   — stamp X-Request-ID on every request
+	// 3. ZapLogger   — structured JSON request log (replaces gin.Logger)
+	// 4. SecurityHeaders — defensive HTTP headers + tightened CORS
+	// 5. PrometheusMetrics — Prometheus counters/histograms
+	r.Use(
+		gin.Recovery(),
+		middleware.RequestID(),
+		middleware.ZapLogger(),
+		middleware.SecurityHeaders(),
+		middleware.PrometheusMetrics(),
+	)
 
 	r.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -109,15 +129,18 @@ func main() {
 	search := handler.NewSearch(pool, rdb)
 
 	requireAuth := middleware.RequireAuth(jwtSecret)
+	auditLog := middleware.AuditLog(pool)
+	loginLimit := middleware.LoginRateLimit(rdb.Client())
 
 	v1 := r.Group("/v1")
+	v1.Use(auditLog) // Audit every write under /v1
 	{
-		// Auth (public)
+		// Auth — login route has brute-force protection
 		v1.POST("/auth/register", auth.Register)
-		v1.POST("/auth/login", auth.Login)
+		v1.POST("/auth/login", loginLimit, auth.Login)
 		v1.GET("/auth/me", requireAuth, auth.Me)
 
-		// Artists (public)
+		// Artists (read public, write protected)
 		v1.GET("/artists", artists.List)
 		v1.POST("/artists", requireAuth, artists.Create)
 		v1.GET("/artists/:id", artists.Get)
@@ -154,31 +177,33 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("beatstream API listening on :%s", port)
+		log.Info("beatstream API started", zap.String("port", port))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server: %v", err)
+			log.Fatal("server", zap.Error(err))
 		}
 	}()
 	go func() {
-		log.Printf("metrics server listening on :%s/metrics", metricsPort)
+		log.Info("metrics server started", zap.String("port", metricsPort))
 		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("metrics server: %v", err)
+			log.Warn("metrics server stopped", zap.Error(err))
 		}
 	}()
 
 	<-quit
-	log.Println("shutting down...")
+	log.Info("shutting down gracefully...")
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	srv.Shutdown(shutCtx)
 	metricsSrv.Shutdown(shutCtx)
+
+	log.Info("shutdown complete")
 }
 
 func mustEnv(key string) string {
 	v := os.Getenv(key)
 	if v == "" {
-		log.Fatalf("required env var %s is not set", key)
+		applogger.L().Fatal("required env var not set", zap.String("key", key))
 	}
 	return v
 }
