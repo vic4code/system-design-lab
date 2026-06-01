@@ -246,3 +246,7 @@ Open http://localhost:9001 (credentials: minioadmin / minioadmin)
 **Expected output:** A `tracks/<uuid>/audio` object inside the `beatstream-audio` bucket.
 
 **What this demonstrates:** The API PUTs the binary directly to MinIO (S3-compatible object storage) rather than writing to local disk — the correct cloud-native storage approach.
+
+---
+
+**[← Back to Beatstream README](../beatstream/README.md) · [Phase 1 — Load Balancing & Caching →](phase-1.md)**
