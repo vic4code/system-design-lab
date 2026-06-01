@@ -1,18 +1,32 @@
 services:
+
+  # ── Public tier ─────────────────────────────────────────────────────────────
+  # AWS equivalent: ALB in public subnets.
+  # Only nginx is reachable from the host. Everything else is network-isolated.
+  # Security group analogy: nginx-sg allows 0.0.0.0/0:80,443 inbound.
   nginx:
     image: nginx:alpine
     ports:
       - "80:80"
-      - "443:443"  # HTTPS — mkcert cert (run: make certs)
+      - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/certs:/etc/nginx/certs:ro  # TLS certs (gitignored keys)
+      - ./nginx/certs:/etc/nginx/certs:ro
     depends_on:
       - api-1
       - api-2
       - api-3
+    networks:
+      - public   # reachable from host
+      - app      # can reach api-1/2/3
     restart: unless-stopped
 
+  # ── App tier ─────────────────────────────────────────────────────────────────
+  # AWS equivalent: ECS Fargate tasks in private subnets.
+  # Reachable only from nginx (app network). Cannot be reached directly from
+  # the host or from the data network direction (data services cannot initiate
+  # connections to the API — only API initiates to data).
+  # Security group analogy: api-sg allows :8080 from alb-sg only.
   api-1:
     build:
       context: .
@@ -44,6 +58,10 @@ services:
         condition: service_started
       redpanda:
         condition: service_healthy
+    networks:
+      - app        # receives traffic from nginx
+      - data       # initiates connections to postgres/redis/minio/redpanda
+      - monitoring # exposes :9090/metrics to prometheus
     restart: unless-stopped
 
   api-2:
@@ -74,6 +92,10 @@ services:
         condition: service_started
       redpanda:
         condition: service_healthy
+    networks:
+      - app
+      - data
+      - monitoring
     restart: unless-stopped
 
   api-3:
@@ -104,8 +126,15 @@ services:
         condition: service_started
       redpanda:
         condition: service_healthy
+    networks:
+      - app
+      - data
+      - monitoring
     restart: unless-stopped
 
+  # Worker: no inbound traffic — only pulls from Kafka and writes to Postgres.
+  # AWS equivalent: ECS task with no ALB target group attachment.
+  # Security group analogy: worker-sg has no ingress rules.
   worker:
     build:
       context: .
@@ -118,6 +147,43 @@ services:
         condition: service_healthy
       redpanda:
         condition: service_healthy
+    networks:
+      - data  # needs postgres + redpanda; cannot be reached from app or public
+    restart: unless-stopped
+
+  # ── Data tier ────────────────────────────────────────────────────────────────
+  # AWS equivalent: RDS/Aurora, ElastiCache, MSK — all in private subnets with
+  # no internet gateway route. Only accessible from the app tier.
+  # Security group analogy:
+  #   rds-sg:   allows :5432 from api-sg and worker-sg only
+  #   redis-sg: allows :6379 from api-sg only
+  #   msk-sg:   allows :9092 from api-sg and worker-sg only
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: beatstream
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/migrations:/migrations
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d beatstream"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    # No host port mapping — not reachable from outside Docker.
+    # To connect for debugging: docker compose exec postgres psql -U user -d beatstream
+    networks:
+      - data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # No host port mapping — not directly reachable from host.
+    networks:
+      - data
     restart: unless-stopped
 
   redpanda:
@@ -139,37 +205,14 @@ services:
       - PLAINTEXT://0.0.0.0:9092
       - --advertise-kafka-addr
       - PLAINTEXT://redpanda:9092
-    ports:
-      - "9092:9092"
     healthcheck:
       test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 10
       start_period: 20s
-    restart: unless-stopped
-
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: beatstream
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: pass
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./db/migrations:/migrations
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U user -d beatstream"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    ports:
-      - "5432:5432"
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    networks:
+      - data
     restart: unless-stopped
 
   minio:
@@ -181,22 +224,29 @@ services:
     volumes:
       - miniodata:/data
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "9001:9001"  # MinIO console — debug access only
+    # Port 9000 (S3 API) intentionally not exposed to host.
+    # Pre-signed URLs use localhost:9000 only because S3_PRESIGN_ENDPOINT=http://localhost:9000;
+    # in production this points to CloudFront/S3 directly.
+    networks:
+      - data
     restart: unless-stopped
 
-  # ── Jaeger — distributed tracing UI (OTel third pillar) ─────────────────────
-  # Traces: http://localhost:16686
-  # OTLP ingest (HTTP): http://localhost:4318
-  # Correlate with logs via trace_id field in zap JSON output
-  # AWS equivalent: AWS X-Ray (use ADOT sidecar collector in ECS)
+  # ── Observability tier ───────────────────────────────────────────────────────
+  # Prometheus scrapes metrics from API containers via the monitoring network.
+  # Grafana and Jaeger are accessible from the host for dashboards/traces.
+  # AWS equivalent: CloudWatch + X-Ray — both are outside the VPC but
+  # ECS tasks push to them via VPC endpoints (no NAT needed).
+
   jaeger:
     image: jaegertracing/all-in-one:latest
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     ports:
       - "16686:16686"  # Jaeger UI
-      - "4318:4318"    # OTLP HTTP ingest
+      - "4318:4318"    # OTLP ingest — API containers push traces here
+    networks:
+      - monitoring
     restart: unless-stopped
 
   prometheus:
@@ -205,6 +255,8 @@ services:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
       - "9090:9090"
+    networks:
+      - monitoring
     restart: unless-stopped
 
   grafana:
@@ -218,7 +270,23 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
     depends_on:
       - prometheus
+    networks:
+      - monitoring
     restart: unless-stopped
+
+networks:
+  public:
+    # Internet-facing. Only nginx lives here.
+    # AWS: public subnets with IGW route.
+  app:
+    # Application tier. nginx → api traffic flows here.
+    # AWS: private subnets, ECS tasks, ALB target group.
+  data:
+    # Data tier. api → postgres/redis/redpanda/minio, worker → postgres/redpanda.
+    # AWS: private subnets, RDS/ElastiCache/MSK security groups allow only from api-sg/worker-sg.
+  monitoring:
+    # Observability plane. Prometheus scrapes api metrics; Jaeger receives traces.
+    # AWS: CloudWatch agent sidecar / ADOT collector — separate from data plane.
 
 volumes:
   pgdata:
