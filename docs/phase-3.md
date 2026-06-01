@@ -449,13 +449,15 @@ Entire sequence completes in 5–10 seconds, fully event-driven via watches. No 
 
 | Phase | Focus | Key concepts |
 |---|---|---|
-| Phase 0 | Local monolith | REST API, PostgreSQL, MinIO |
-| Phase 1 | Load balancing + caching | nginx, Redis cache-aside, rate limiting |
-| Phase 2 | Async queues | Redpanda/Kafka, at-least-once, worker |
-| **Phase 3** | **Kubernetes** | **Deployment, StatefulSet, HPA, probes, rolling update** |
-| Phase 4 | Cloud (EKS/GKE) | Managed K8s, LoadBalancer, Blue-Green deploy |
-| Phase 5 | Observability | Prometheus, Grafana, distributed tracing |
-| Phase 6 | Canary deploy | Traffic splitting, automated rollback (requires Phase 5 metrics) |
+| Phase 0 | Local monolith | REST API, PostgreSQL, MinIO, pre-signed URLs |
+| Phase 1 | Load balancing + caching | nginx, Redis cache-aside, token-bucket rate limiting, Prometheus |
+| Phase 2 | Async queues | Redpanda/Kafka, at-least-once delivery, upload + analytics workers |
+| **Phase 3** | **Kubernetes** | **Deployment, StatefulSet, HPA, probes, rolling update, Secrets** |
+| Phase 4 | Frontend | Next.js App Router, React Context, CORS, Vercel deploy |
+| Phase 5 | Authentication | JWT, bcrypt, protected routes, multi-user |
+| Phase 6 | Security | Structured logging (zap), audit trail, security headers, TLS, OTel |
+| Phase 7 | RBAC + GDPR | Role column, RequireRole middleware, soft-delete, data export |
+| Phase 8 | AWS cloud deployment | ECS Fargate, Aurora, ElastiCache, MSK, CloudFront, Terraform |
 
 ---
 
@@ -545,7 +547,13 @@ make k8s-deploy
 
 # Wait for all pods to be ready (approximately 60–120 seconds)
 kubectl -n beatstream get pods -w
+
+# Port-forward to reach the API from your local machine
+kubectl -n beatstream port-forward svc/api 8080:80 &
+# All curl examples below use http://localhost:8080
 ```
+
+> **Note on `beatstream.local`:** To use the Ingress hostname instead of port-forward, add `127.0.0.1 beatstream.local` to `/etc/hosts` and ensure the nginx-ingress controller is installed in the kind cluster. Port-forward is simpler for local demos.
 
 ---
 
@@ -626,7 +634,7 @@ kubectl -n beatstream rollout restart deployment/api
 
 # Send requests continuously during the update — no 5xx should appear
 while true; do
-  curl -s http://beatstream.local/v1/tracks -o /dev/null -w "%{http_code}\n"
+  curl -s http://localhost:8080/v1/tracks -o /dev/null -w "%{http_code}\n"
   sleep 0.1
 done
 ```
