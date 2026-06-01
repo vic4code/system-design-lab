@@ -33,12 +33,16 @@ run-worker:
 test:
 	go test ./... -v
 
-# Run database migrations
+# Run database migrations (idempotent — safe to re-run)
 migrate:
 	docker compose exec postgres psql -U user -d beatstream \
 		-f /migrations/001_create_tracks.sql \
 		-f /migrations/002_create_playlists.sql \
-		-f /migrations/003_create_play_events.sql
+		-f /migrations/003_create_play_events.sql \
+		-f /migrations/004_add_track_status.sql \
+		-f /migrations/005_create_users.sql \
+		-f /migrations/006_audit_logs.sql \
+		-f /migrations/007_rbac_gdpr.sql
 
 # Run k6 load test (requires TRACK_ID env var)
 load-test:
