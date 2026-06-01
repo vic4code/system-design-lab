@@ -11,6 +11,7 @@ import (
 const UserIDKey = "user_id"
 const UserEmailKey = "user_email"
 const UserNameKey = "user_name"
+const UserRoleKey = "user_role"
 
 // RequireAuth rejects requests without a valid JWT.
 func RequireAuth(secret string) gin.HandlerFunc {
@@ -30,6 +31,20 @@ func RequireAuth(secret string) gin.HandlerFunc {
 		c.Set(UserIDKey, claims["user_id"])
 		c.Set(UserEmailKey, claims["email"])
 		c.Set(UserNameKey, claims["name"])
+		c.Set(UserRoleKey, claims["role"])
+		c.Next()
+	}
+}
+
+// RequireRole checks that the authenticated user has the given role.
+// Must be used after RequireAuth.
+func RequireRole(role string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		userRole, _ := c.Get(UserRoleKey)
+		if userRole != role {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+			return
+		}
 		c.Next()
 	}
 }
@@ -43,6 +58,7 @@ func OptionalAuth(secret string) gin.HandlerFunc {
 				c.Set(UserIDKey, claims["user_id"])
 				c.Set(UserEmailKey, claims["email"])
 				c.Set(UserNameKey, claims["name"])
+				c.Set(UserRoleKey, claims["role"])
 			}
 		}
 		c.Next()
