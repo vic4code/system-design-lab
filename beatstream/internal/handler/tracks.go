@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,7 +13,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/zap"
+
 	"github.com/vic4code/system-design-lab/beatstream/internal/cache"
+	applogger "github.com/vic4code/system-design-lab/beatstream/internal/logger"
 	"github.com/vic4code/system-design-lab/beatstream/internal/metrics"
 	"github.com/vic4code/system-design-lab/beatstream/internal/queue"
 	"github.com/vic4code/system-design-lab/beatstream/internal/storage"
@@ -175,7 +179,8 @@ func (h *Tracks) Create(c *gin.Context) {
 	}
 
 	if err := h.store.Upload(c.Request.Context(), audioKey,
-		newBytesReader(data), int64(len(data)), contentType); err != nil {
+		bytes.NewReader(data), int64(len(data)), contentType); err != nil {
+		applogger.L().Error("s3 upload failed", zap.Error(err), zap.String("key", audioKey))
 		c.JSON(http.StatusInternalServerError, apiError("failed to upload audio"))
 		return
 	}
