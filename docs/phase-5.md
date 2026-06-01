@@ -196,3 +196,7 @@ curl -s -X POST https://localhost/v1/playlists \
   -d '{"name":"My Playlist"}' | python3 -m json.tool
 # → {"id":"...","name":"My Playlist"}
 ```
+
+---
+
+**[← Phase 4 — Frontend](phase-4.md) · [Phase 6 — Security Foundations →](phase-6.md)**

@@ -691,3 +691,7 @@ k6 run k6/load.js &
 ```
 
 **Expected output:** RPS rising in real time, p95 latency curve, cache hit rate approaching 100%.
+
+---
+
+**[← Phase 0 — Local Monolith](phase-0.md) · [Phase 2 — Async & Queues →](phase-2.md)**

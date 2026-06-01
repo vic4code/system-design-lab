@@ -316,3 +316,7 @@ docker compose logs worker --tail 5
 ```
 
 **What this demonstrates:** Kafka is a durable message log, not an in-memory queue. Messages are not lost when the worker crashes and restarts.
+
+---
+
+**[← Phase 1 — Load Balancing & Caching](phase-1.md) · [Phase 3 — Kubernetes →](phase-3.md)**

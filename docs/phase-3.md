@@ -445,22 +445,6 @@ Entire sequence completes in 5–10 seconds, fully event-driven via watches. No 
 
 ---
 
-## Phase Roadmap
-
-| Phase | Focus | Key concepts |
-|---|---|---|
-| Phase 0 | Local monolith | REST API, PostgreSQL, MinIO, pre-signed URLs |
-| Phase 1 | Load balancing + caching | nginx, Redis cache-aside, token-bucket rate limiting, Prometheus |
-| Phase 2 | Async queues | Redpanda/Kafka, at-least-once delivery, upload + analytics workers |
-| **Phase 3** | **Kubernetes** | **Deployment, StatefulSet, HPA, probes, rolling update, Secrets** |
-| Phase 4 | Frontend | Next.js App Router, React Context, CORS, Vercel deploy |
-| Phase 5 | Authentication | JWT, bcrypt, protected routes, multi-user |
-| Phase 6 | Security | Structured logging (zap), audit trail, security headers, TLS, OTel |
-| Phase 7 | RBAC + GDPR | Role column, RequireRole middleware, soft-delete, data export |
-| Phase 8 | AWS cloud deployment | ECS Fargate, Aurora, ElastiCache, MSK, CloudFront, Terraform |
-
----
-
 ## Local Dev Commands
 
 ```bash
@@ -656,3 +640,7 @@ kubectl -n beatstream get secret beatstream-secrets -o yaml | grep -E "DATABASE|
 **Expected output:** ConfigMap values are readable strings; Secret values are base64 strings (e.g. `cGFzc3dvcmQ=`).
 
 **What this demonstrates:** Storing credentials in Secrets provides two advantages: ① RBAC can be configured independently (only specific ServiceAccounts can mount them) ② the backend can later be replaced with AWS Secrets Manager or Vault without any application code changes.
+
+---
+
+**[← Phase 2 — Async & Queues](phase-2.md) · [Phase 4 — Frontend →](phase-4.md)**

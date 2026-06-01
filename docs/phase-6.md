@@ -336,3 +336,7 @@ In Jaeger, select Service: `beatstream-api` → Find Traces
   - `postgres.query` (if cache miss)
 
 **What this demonstrates:** When a request is unusually slow, you can identify exactly which DB query took the most time — no guessing required.
+
+---
+
+**[← Phase 5 — JWT Authentication](phase-5.md) · [Phase 7 — RBAC + GDPR →](phase-7.md)**
