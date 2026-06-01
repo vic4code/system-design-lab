@@ -31,28 +31,55 @@ export default function SearchPage() {
   }, [query]);
 
   return (
-    <div className="max-w-3xl mx-auto px-6 py-8">
-      <h1 className="text-2xl font-bold mb-6">Search</h1>
+    <div
+      className="min-h-full"
+      style={{ background: "linear-gradient(to bottom, #2a1a3a 0%, #121212 40%)" }}
+    >
+      <div className="px-6 pt-14 pb-6">
+        <h1 className="text-3xl font-bold mb-6">Search</h1>
 
-      <input
-        autoFocus
-        type="text"
-        placeholder="Track title, artist…"
-        value={query}
-        onChange={(e) => setQuery(e.target.value)}
-        className="input w-full mb-6"
-      />
+        {/* Search input */}
+        <div className="relative max-w-sm mb-8">
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-subdued pointer-events-none"
+          >
+            <circle cx="11" cy="11" r="8" />
+            <path d="m21 21-4.35-4.35" />
+          </svg>
+          <input
+            autoFocus
+            type="text"
+            placeholder="What do you want to play?"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            className="w-full bg-surface-2 text-white rounded-full pl-10 pr-4 py-3 text-sm outline-none focus:ring-2 focus:ring-white placeholder-subdued"
+          />
+        </div>
 
-      {loading && <p className="text-muted text-sm">Searching…</p>}
+        {!query && (
+          <p className="text-muted text-sm">Start typing to search tracks.</p>
+        )}
+        {loading && <p className="text-muted text-sm">Searching…</p>}
+        {!loading && query && results.length === 0 && (
+          <p className="text-muted text-sm">No results for "{query}"</p>
+        )}
 
-      {!loading && query && results.length === 0 && (
-        <p className="text-muted text-sm">No results for "{query}"</p>
-      )}
-
-      <div className="space-y-1">
-        {results.map((t, i) => (
-          <TrackRow key={t.id} track={t} index={i + 1} />
-        ))}
+        {results.length > 0 && (
+          <div>
+            <div className="grid grid-cols-[16px_1fr_auto] gap-x-4 px-4 pb-2 border-b border-white/10 mb-2 text-xs font-semibold text-muted uppercase tracking-wider">
+              <span className="text-center">#</span>
+              <span>Title</span>
+              <span className="pr-6">Duration</span>
+            </div>
+            {results.map((t, i) => (
+              <TrackRow key={t.id} track={t} index={i + 1} />
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

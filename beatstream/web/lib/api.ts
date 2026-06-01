@@ -2,16 +2,36 @@
 // In production, NEXT_PUBLIC_API_URL points to the deployed API directly.
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
 
+function getToken(): string | null {
+  if (typeof window === "undefined") return null;
+  return localStorage.getItem("bs_token");
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, init);
+  const token = getToken();
+  const headers: Record<string, string> = {
+    ...(init?.headers as Record<string, string>),
+  };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  const res = await fetch(`${BASE}${path}`, { ...init, headers });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.error ?? `${res.status} ${res.statusText}`);
   }
+  // 204 No Content
+  if (res.status === 204) return undefined as T;
   return res.json();
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
+
+export type User = {
+  id: string;
+  email: string;
+  name: string;
+  created_at: string;
+};
 
 export type Track = {
   id: string;
@@ -37,6 +57,22 @@ export type Playlist = {
   created_at: string;
 };
 
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+
+export const register = (email: string, password: string, name: string) =>
+  req<{ token: string; user: User }>(`/v1/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password, name }),
+  });
+
+export const login = (email: string, password: string) =>
+  req<{ token: string; user: User }>(`/v1/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+
 // ─── Tracks ───────────────────────────────────────────────────────────────────
 
 export const listTracks = () =>
@@ -50,8 +86,6 @@ export const searchTracks = (q: string) =>
 export const uploadTrack = (form: FormData) =>
   req<Track>(`/v1/tracks`, { method: "POST", body: form });
 
-// Stream URL — the API returns a 307 redirect to the pre-signed audio URL.
-// Pass directly to <audio src> or <a href>.
 export const streamUrl = (id: string) => `${BASE}/v1/tracks/${id}/stream`;
 
 // ─── Artists ──────────────────────────────────────────────────────────────────
@@ -73,15 +107,15 @@ export const listPlaylists = () =>
 
 export const getPlaylist = (id: string) => req<Playlist>(`/v1/playlists/${id}`);
 
-export const createPlaylist = (name: string, description?: string) =>
+export const createPlaylist = (name: string) =>
   req<Playlist>(`/v1/playlists`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, description }),
+    body: JSON.stringify({ name }),
   });
 
 export const getPlaylistTracks = (id: string) =>
-  req<{ items: Track[]; total: number }>(`/v1/playlists/${id}/tracks`);
+  req<{ items: Track[]; has_more: boolean; next_cursor: string }>(`/v1/playlists/${id}/tracks`);
 
 export const addTrackToPlaylist = (playlistId: string, trackId: string) =>
   req<void>(`/v1/playlists/${playlistId}/tracks`, {

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,72 +10,124 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
+	"go.uber.org/zap"
+
 	"github.com/vic4code/system-design-lab/beatstream/internal/cache"
 	"github.com/vic4code/system-design-lab/beatstream/internal/db"
 	"github.com/vic4code/system-design-lab/beatstream/internal/handler"
+	applogger "github.com/vic4code/system-design-lab/beatstream/internal/logger"
 	"github.com/vic4code/system-design-lab/beatstream/internal/middleware"
 	"github.com/vic4code/system-design-lab/beatstream/internal/queue"
 	"github.com/vic4code/system-design-lab/beatstream/internal/storage"
+	"github.com/vic4code/system-design-lab/beatstream/internal/telemetry"
 )
 
 func main() {
+	// ── Structured logger ──────────────────────────────────────────────────────
+	// LOG_FORMAT=json → newline-delimited JSON (CloudWatch)
+	// LOG_FORMAT=console (default) → coloured human-readable (local dev)
+	log := applogger.Init()
+	defer applogger.Sync()
+
 	ctx := context.Background()
+
+	// ── OpenTelemetry tracing ──────────────────────────────────────────────────
+	// Third pillar of observability: Logs (zap) + Metrics (Prometheus) + Traces (OTel)
+	// OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318 (local) or ADOT sidecar (AWS)
+	// Traces flow: gin handler → child spans for DB/Redis → exported via OTLP
+	otelShutdown, err := telemetry.Init(ctx)
+	if err != nil {
+		log.Warn("OpenTelemetry init failed — tracing disabled", zap.Error(err))
+	} else {
+		defer otelShutdown(ctx)
+		log.Info("OpenTelemetry tracing enabled",
+			zap.String("endpoint", func() string {
+				if ep := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); ep != "" {
+					return ep
+				}
+				return "http://localhost:4318"
+			}()),
+		)
+	}
 
 	pool, err := db.Connect(mustEnv("DATABASE_URL"))
 	if err != nil {
-		log.Fatalf("db connect: %v", err)
+		log.Fatal("db connect", zap.Error(err))
 	}
 	defer pool.Close()
 
 	if err := db.Migrate(pool); err != nil {
-		log.Fatalf("db migrate: %v", err)
+		log.Fatal("db migrate", zap.Error(err))
 	}
 
-	// S3-compatible storage.
-	// Local dev: set S3_ENDPOINT=http://minio:9000 + S3_ACCESS_KEY/S3_SECRET_KEY.
-	// AWS ECS:   leave S3_ENDPOINT unset — the task role provides credentials.
-	// S3_PRESIGN_ENDPOINT: browser-accessible URL for pre-signed audio links.
-	//   In docker-compose set to http://localhost:9000 so browsers can reach MinIO.
-	store, err := storage.New(ctx, storage.Config{
-		Bucket:          mustEnv("S3_BUCKET"),
-		Region:          getEnv("AWS_REGION", "us-east-1"),
-		Endpoint:        os.Getenv("S3_ENDPOINT"),
-		AccessKey:       os.Getenv("S3_ACCESS_KEY"),
-		SecretKey:       os.Getenv("S3_SECRET_KEY"),
-		PresignEndpoint: os.Getenv("S3_PRESIGN_ENDPOINT"),
-	})
-	if err != nil {
-		log.Fatalf("storage init: %v", err)
-	}
-	// EnsureBucket is a no-op when the bucket already exists (AWS path).
-	// For local MinIO it creates the bucket on first run.
-	if os.Getenv("S3_ENDPOINT") != "" {
-		if err := store.EnsureBucket(ctx); err != nil {
-			log.Fatalf("ensure bucket: %v", err)
+	// ── S3-compatible storage (optional) ───────────────────────────────────────
+	// Local dev: S3_ENDPOINT=http://minio:9000 + S3_ACCESS_KEY/S3_SECRET_KEY
+	// AWS ECS:   leave S3_ENDPOINT unset — ECS task role provides credentials
+	// S3_PRESIGN_ENDPOINT: browser-accessible URL for pre-signed audio links
+	var store *storage.Storage
+	if bucket := os.Getenv("S3_BUCKET"); bucket != "" {
+		store, err = storage.New(ctx, storage.Config{
+			Bucket:          bucket,
+			Region:          getEnv("AWS_REGION", "us-east-1"),
+			Endpoint:        os.Getenv("S3_ENDPOINT"),
+			AccessKey:       os.Getenv("S3_ACCESS_KEY"),
+			SecretKey:       os.Getenv("S3_SECRET_KEY"),
+			PresignEndpoint: os.Getenv("S3_PRESIGN_ENDPOINT"),
+		})
+		if err != nil {
+			log.Fatal("storage init", zap.Error(err))
 		}
+		if os.Getenv("S3_ENDPOINT") != "" {
+			if err := store.EnsureBucket(ctx); err != nil {
+				log.Fatal("ensure bucket", zap.Error(err))
+			}
+		}
+	} else {
+		log.Info("S3_BUCKET not set — upload/stream disabled")
 	}
 
 	rdb, err := cache.NewRedis(mustEnv("REDIS_URL"))
 	if err != nil {
-		log.Fatalf("redis connect: %v", err)
+		log.Fatal("redis connect", zap.Error(err))
 	}
 
-	// Kafka producer.
-	// Local Redpanda: KAFKA_AUTH unset → plaintext.
-	// AWS MSK:        KAFKA_AUTH=iam → SASL/IAM via ECS task role.
+	// ── Kafka producer (optional) ───────────────────────────────────────────────
+	// KAFKA_AUTH=iam → MSK SASL/IAM (production); unset → PLAINTEXT (local)
 	var producer *queue.Producer
-	if os.Getenv("KAFKA_AUTH") == "iam" {
-		producer, err = queue.NewProducerIAM(mustEnv("KAFKA_BROKERS"), mustEnv("AWS_REGION"))
+	if brokers := os.Getenv("KAFKA_BROKERS"); brokers != "" {
+		if os.Getenv("KAFKA_AUTH") == "iam" {
+			producer, err = queue.NewProducerIAM(brokers, mustEnv("AWS_REGION"))
+		} else {
+			producer, err = queue.NewProducer(brokers)
+		}
+		if err != nil {
+			log.Fatal("kafka producer", zap.Error(err))
+		}
+		defer producer.Close()
 	} else {
-		producer, err = queue.NewProducer(mustEnv("KAFKA_BROKERS"))
+		log.Info("KAFKA_BROKERS not set — upload pipeline disabled")
 	}
-	if err != nil {
-		log.Fatalf("kafka producer: %v", err)
-	}
-	defer producer.Close()
 
+	// ── Gin engine ─────────────────────────────────────────────────────────────
+	gin.SetMode(getEnv("GIN_MODE", "debug"))
 	r := gin.New()
-	r.Use(gin.Logger(), gin.Recovery(), middleware.CORS(), middleware.RequestID(), middleware.PrometheusMetrics())
+
+	// Middleware stack (order matters):
+	// 1. Recovery         — catch panics, return 500
+	// 2. OtelGin          — create root OTel span per request (must be early)
+	// 3. RequestID        — stamp X-Request-ID (reuse OTel trace_id if available)
+	// 4. ZapLogger        — structured JSON log with trace_id + request_id correlation
+	// 5. SecurityHeaders  — defensive HTTP headers + CORS
+	// 6. PrometheusMetrics — Prometheus counters/histograms
+	r.Use(
+		gin.Recovery(),
+		otelgin.Middleware("beatstream-api"), // Creates root span; propagates W3C traceparent
+		middleware.RequestID(),
+		middleware.ZapLogger(),
+		middleware.SecurityHeaders(),
+		middleware.PrometheusMetrics(),
+	)
 
 	r.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -92,32 +143,47 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"status": "ready"})
 	})
 
+	jwtSecret := getEnv("JWT_SECRET", "dev-secret-change-in-production")
+
+	auth := handler.NewAuth(pool, jwtSecret)
 	artists := handler.NewArtists(pool)
 	tracks := handler.NewTracks(pool, store, rdb, producer)
 	playlists := handler.NewPlaylists(pool)
 	search := handler.NewSearch(pool, rdb)
 
+	requireAuth := middleware.RequireAuth(jwtSecret)
+	auditLog := middleware.AuditLog(pool)
+	loginLimit := middleware.LoginRateLimit(rdb.Client())
+
 	v1 := r.Group("/v1")
+	v1.Use(auditLog) // Audit every write under /v1
 	{
+		// Auth — login route has brute-force protection
+		v1.POST("/auth/register", auth.Register)
+		v1.POST("/auth/login", loginLimit, auth.Login)
+		v1.GET("/auth/me", requireAuth, auth.Me)
+
+		// Artists (read public, write protected)
 		v1.GET("/artists", artists.List)
-		v1.POST("/artists", artists.Create)
+		v1.POST("/artists", requireAuth, artists.Create)
 		v1.GET("/artists/:id", artists.Get)
 
+		// Tracks (read public, write protected)
 		v1.GET("/tracks", tracks.List)
-
 		v1.GET("/tracks/:id", tracks.Get)
-		v1.POST("/tracks", tracks.Create)
+		v1.POST("/tracks", requireAuth, tracks.Create)
 		v1.GET("/tracks/:id/stream",
 			middleware.StreamRateLimit(rdb.Client(), 100),
 			tracks.Stream,
 		)
 
+		// Playlists (read public, write protected)
 		v1.GET("/playlists", playlists.List)
 		v1.GET("/playlists/:id", playlists.Get)
-		v1.POST("/playlists", playlists.Create)
+		v1.POST("/playlists", requireAuth, playlists.Create)
 		v1.GET("/playlists/:id/tracks", playlists.ListTracks)
-		v1.POST("/playlists/:id/tracks", playlists.AddTrack)
-		v1.DELETE("/playlists/:id/tracks/:track_id", playlists.RemoveTrack)
+		v1.POST("/playlists/:id/tracks", requireAuth, playlists.AddTrack)
+		v1.DELETE("/playlists/:id/tracks/:track_id", requireAuth, playlists.RemoveTrack)
 
 		v1.GET("/search", search.Search)
 	}
@@ -134,31 +200,33 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("beatstream API listening on :%s", port)
+		log.Info("beatstream API started", zap.String("port", port))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server: %v", err)
+			log.Fatal("server", zap.Error(err))
 		}
 	}()
 	go func() {
-		log.Printf("metrics server listening on :%s/metrics", metricsPort)
+		log.Info("metrics server started", zap.String("port", metricsPort))
 		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("metrics server: %v", err)
+			log.Warn("metrics server stopped", zap.Error(err))
 		}
 	}()
 
 	<-quit
-	log.Println("shutting down...")
+	log.Info("shutting down gracefully...")
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	srv.Shutdown(shutCtx)
 	metricsSrv.Shutdown(shutCtx)
+
+	log.Info("shutdown complete")
 }
 
 func mustEnv(key string) string {
 	v := os.Getenv(key)
 	if v == "" {
-		log.Fatalf("required env var %s is not set", key)
+		applogger.L().Fatal("required env var not set", zap.String("key", key))
 	}
 	return v
 }
