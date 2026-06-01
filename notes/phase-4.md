@@ -165,3 +165,77 @@ make web-dev
 
 > *"What breaks when you navigate between pages?"*
 > Nothing — the `Audio` object lives in the Context provider which wraps the entire app. Next.js App Router only unmounts/remounts `{children}`, not the root layout. The Player bar stays mounted and keeps playing.
+
+---
+
+## Demo
+
+**前置：**
+```bash
+make up && make migrate && make seed   # 後端
+make web-install                        # 安裝 npm 依賴
+make web-dev                            # 前端 dev server（另開 terminal）
+```
+
+打開 http://localhost:3001
+
+---
+
+### 1. 播放音樂 → 看到 HTML5 Audio 直接打 MinIO
+
+打開 Chrome DevTools → Network tab → 點任一首歌的播放鍵
+
+**你應該看到：**
+- 一個 `GET /v1/tracks/:id/stream` → 回 `307 Redirect`
+- 接著一個 `GET http://localhost:9000/beatstream-audio/...?X-Amz-Signature=...` → 回 `206 Partial Content`（Range request）
+
+**這說明了什麼：** 音訊流量完全不經過 API server，直接走 MinIO。`206 Partial Content` 是 browser 的 Range request 機制，支援 seek（拖曳進度條）。
+
+---
+
+### 2. 跨頁面導航 → 看到音樂不中斷
+
+在首頁播放一首歌 → 點上方 Search 連結 → 搜尋 "karma"
+
+**你應該看到：** 音樂繼續播，底部 Player bar 不消失，進度條持續前進。
+
+**這說明了什麼：** `Audio` 物件存在 React Context（`PlayerContext`）裡，Context provider 在 root layout — Next.js App Router 只更換 `{children}`，不 unmount root layout，所以 Audio 物件不被銷毀。
+
+---
+
+### 3. Search debounce → 觀察 Network 請求數量
+
+打開 DevTools Network → 到 /search 頁面 → 快速打 "radiohead"
+
+**你應該看到：** 不是每打一個字就發一個 request，而是停止輸入 300ms 後才發。打 8 個字只有 1–2 個 `GET /v1/search?q=...` 請求。
+
+**這說明了什麼：** 300ms debounce 避免對後端發出大量無意義的中間查詢，降低 DB 和 Redis 的壓力。
+
+---
+
+### 4. Upload flow → 看到 status polling
+
+去 /upload 頁面（需要先登入，Phase 5）→ 上傳一個 mp3
+
+**你應該看到：**
+1. 送出後立刻顯示 `status: pending`
+2. 頁面輪詢 `GET /v1/tracks/:id` 每 2 秒
+3. Worker 處理完後顯示 `status: ready`
+
+**DevTools Network 你應該看到：** 每 2 秒一個 GET request，直到拿到 `ready`。
+
+---
+
+### 5. CORS header — 看到 browser 為何能跨 origin 打 API
+
+```bash
+curl -sk -I -H "Origin: http://localhost:3001" https://localhost/v1/tracks | grep -i "access-control"
+```
+
+**你應該看到：**
+```
+Access-Control-Allow-Origin: http://localhost:3001
+Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
+```
+
+**這說明了什麼：** browser 的 Same-Origin Policy 預設阻止跨 origin 的 XHR/fetch。`ALLOWED_ORIGINS` env var 控制白名單，production 改成實際 domain，不用 `*`（wildcard 不能帶 credentials）。

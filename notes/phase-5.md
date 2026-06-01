@@ -99,3 +99,100 @@ Balances security vs. login latency (~100ms). For higher-traffic production use 
 
 > *"How do you revoke a JWT before it expires?"*
 > JWT is stateless — you can't revoke without a server-side store. Options: (1) token blocklist in Redis (check on each request); (2) short expiry + refresh token rotation (rotation invalidates on reuse).
+
+---
+
+## Demo
+
+**前置：** `make up && make migrate && make seed`
+
+---
+
+### 1. Register → 看到 JWT token 回傳
+
+```bash
+curl -s -X POST https://localhost/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"demo@example.com","password":"password123","name":"Demo User"}' \
+  | python3 -m json.tool
+```
+
+**你應該看到：**
+```json
+{
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "user": {
+    "id": "uuid...",
+    "email": "demo@example.com",
+    "name": "Demo User",
+    "role": "user"
+  }
+}
+```
+
+**解碼 JWT payload（不需要 secret）：**
+```bash
+TOKEN="（上面的 token）"
+echo $TOKEN | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool
+```
+
+**你應該看到：** `user_id`、`email`、`role`、`exp`（7天後的 unix timestamp）。
+
+**這說明了什麼：** JWT 是 base64 編碼，payload 任何人都可以讀，但不能偽造（需要 `JWT_SECRET` 才能簽名）。Stateless：server 不需要存 session，3 個 API instance 都可以用同一個 secret 驗證。
+
+---
+
+### 2. 沒有 token 打保護路由 → 看到 401
+
+```bash
+curl -s https://localhost/v1/auth/me
+```
+
+**你應該看到：** `{"error":"authentication required"}`
+
+```bash
+# 帶 token
+curl -s https://localhost/v1/auth/me \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+**你應該看到：** 完整的 user 資料。
+
+---
+
+### 3. 錯誤密碼 → 看到 401，且 bcrypt 保護
+
+```bash
+curl -s -X POST https://localhost/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"demo@example.com","password":"wrongpassword"}'
+```
+
+**你應該看到：** `{"error":"invalid email or password"}`（故意模糊，不透露是 email 不存在還是密碼錯）
+
+**驗證密碼是 bcrypt hash，不是明文：**
+```bash
+docker exec beatstream-postgres-1 psql -U user -d beatstream \
+  -c "SELECT email, LEFT(password_hash, 7) FROM users WHERE email='demo@example.com';"
+```
+
+**你應該看到：** `$2a$10$`（bcrypt 格式，cost factor 10）。
+
+---
+
+### 4. 建立 playlist（需要登入）→ 沒 token 就 401
+
+```bash
+# 沒 token
+curl -s -X POST https://localhost/v1/playlists \
+  -H "Content-Type: application/json" \
+  -d '{"name":"My Playlist"}'
+# → {"error":"authentication required"}
+
+# 有 token
+curl -s -X POST https://localhost/v1/playlists \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"My Playlist"}' | python3 -m json.tool
+# → {"id":"...","name":"My Playlist"}
+```

@@ -211,3 +211,128 @@ Benefits over env vars:
 
 > *"What's your GDPR plan for audit log data?"*
 > Audit log IP addresses are personal data. We auto-delete rows older than 90 days via a scheduled PostgreSQL job. In Phase 7 we add the GDPR erasure endpoint — when a user deletes their account, their `user_id` in `audit_logs` is set to NULL (ON DELETE SET NULL in the FK), preserving the security record without linking it to a real person.
+
+---
+
+## Demo
+
+**前置：** `make up && make migrate && make seed`
+
+---
+
+### 1. Structured logging → 看到 JSON log，含 trace_id
+
+```bash
+# 打一個 API，馬上看 log
+curl -sk https://localhost/v1/tracks > /dev/null
+docker compose logs api-1 --tail 3 2>/dev/null | grep "request" | python3 -m json.tool 2>/dev/null | grep -E "status|method|path|latency_ms|user_id|trace_id|request_id"
+```
+
+**你應該看到：**
+```json
+{
+  "status": 200,
+  "method": "GET",
+  "path": "/v1/tracks",
+  "latency_ms": 4,
+  "ip": "192.168.65.1",
+  "request_id": "76172a68...",
+  "trace_id": "d1bb4c3e..."
+}
+```
+
+**這說明了什麼：** 不是 `[GIN] 200 | 4ms | GET /v1/tracks`（純文字，無法機器查詢）。JSON 格式可以直接 CloudWatch Logs Insights 查：`filter status >= 500 | stats avg(latency_ms) by bin(5m)`。`trace_id` 讓你從 log 跳到 Jaeger 看完整的 trace。
+
+---
+
+### 2. Audit log → 看到每個 write operation 都有記錄
+
+```bash
+# 做幾個 write operation
+TOKEN=$(curl -sk -X POST https://localhost/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"audit-demo@example.com","password":"pass123","name":"Audit Demo"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))")
+
+curl -sk -X POST https://localhost/v1/playlists \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Audit Test Playlist"}' > /dev/null
+
+# 查 audit log
+docker exec beatstream-postgres-1 psql -U user -d beatstream \
+  -c "SELECT action, resource_type, ip_address, status_code, created_at FROM audit_logs ORDER BY created_at DESC LIMIT 5;"
+```
+
+**你應該看到：**
+```
+    action      | resource_type |  ip_address  | status_code |         created_at
+----------------+---------------+--------------+-------------+----------------------------
+ auth.register  | user          | 192.168.65.1 |         201 | 2026-06-01 10:04:26.88...
+ playlist.create| playlist      | 192.168.65.1 |         201 | 2026-06-01 10:04:28.12...
+```
+
+**這說明了什麼：** Append-only（沒有 UPDATE/DELETE）。安全調查時可以問「哪個 IP 在 1 小時內打了多少 POST？」或「user_id X 有沒有刪過資料？」
+
+---
+
+### 3. Security headers → 瀏覽器保護機制
+
+```bash
+curl -skI https://localhost/v1/tracks | grep -E "X-Content|X-Frame|Strict-Transport|Content-Security"
+```
+
+**你應該看到：**
+```
+Content-Security-Policy: default-src 'self'; ...
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+```
+
+**每個的作用：**
+- `X-Frame-Options: DENY` → 防止別人把你的頁面放進 iframe（clickjacking）
+- `X-Content-Type-Options: nosniff` → 防止 browser 猜測 Content-Type（MIME confusion attack）
+- `Strict-Transport-Security` → 告訴 browser「永遠用 HTTPS，別降級」（HSTS）
+- `Content-Security-Policy` → 限制哪些來源的 script/style 可以執行
+
+---
+
+### 4. Rate limiting（brute force 保護）→ 看到 429 + retry_after
+
+```bash
+# 連續打 login 錯誤密碼
+for i in $(seq 1 7); do
+  curl -s -X POST https://localhost/v1/auth/login \
+    -H "Content-Type: application/json" \
+    -d '{"email":"audit-demo@example.com","password":"wrong"}' | python3 -c \
+    "import sys,json; d=json.load(sys.stdin); print(f'req $i: {d}')"
+done
+```
+
+**你應該看到：** 前幾次 `{"error":"invalid email or password"}`，之後變成：
+```json
+{"error": "too many login attempts — try again later", "retry_after": 567}
+```
+
+**這說明了什麼：** 攻擊者暴力猜密碼每分鐘最多試幾次，然後就被擋。`retry_after` 告訴 client 多久後可以重試，不讓合法使用者永久被鎖。
+
+---
+
+### 5. OpenTelemetry traces → 在 Jaeger 看一條請求的完整路徑
+
+打開 http://localhost:16686（Jaeger UI）
+
+```bash
+# 觸發一個請求
+curl -sk https://localhost/v1/tracks/aaaa0001-0000-0000-0000-000000000000 > /dev/null
+```
+
+在 Jaeger 選 Service: `beatstream-api` → Find Traces
+
+**你應該看到：** 一個 trace 展開成多個 span：
+- `GET /v1/tracks/:id`（root span，整體耗時）
+  - `redis.get`（cache lookup）
+  - `postgres.query`（如果 cache miss）
+
+**這說明了什麼：** 當某個請求特別慢，你可以找到是哪個 DB query 花最多時間，而不是猜。

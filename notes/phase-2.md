@@ -196,3 +196,123 @@ For analytics (play events), duplicates are tolerable. For financial/critical da
 **Q: What's the problem with publishing to Kafka after the DB insert in the same HTTP handler?**
 
 Split-brain risk: the DB write succeeds but the Kafka publish fails — the track is stuck `pending` forever. The correct fix is the **transactional outbox pattern**: write the event to an `outbox` table in the same DB transaction as the track insert, then have a separate relay process poll the outbox and publish to Kafka. This makes the DB the single source of truth and the publish eventually consistent but reliable.
+
+---
+
+## Demo
+
+**前置：** `make up && make migrate && make seed`（包含 Redpanda）
+
+---
+
+### 1. 上傳 track → 看到 202 Accepted + status=pending（非同步）
+
+```bash
+# 先準備一個假的 mp3
+dd if=/dev/urandom bs=1024 count=50 > /tmp/demo.mp3
+
+# 需要先有 JWT token（Phase 5），但在 Phase 2 這個 endpoint 是 public
+curl -s -X POST https://localhost/v1/tracks \
+  -F "title=Async Demo" \
+  -F "artist_id=11111111-1111-1111-1111-111111111111" \
+  -F "duration_ms=180000" \
+  -F "audio=@/tmp/demo.mp3;type=audio/mpeg" | python3 -m json.tool
+```
+
+**你應該看到：**
+```json
+{
+  "id": "xxxx-...",
+  "title": "Async Demo",
+  "status": "pending",   ← 重點：不是 ready，是 pending
+  "duration_ms": 0       ← 還沒被 worker 處理，duration 還是 0
+}
+```
+
+**這說明了什麼：** API 回 202 不等 transcoding 完成。HTTP handler 做的事：① upload 到 MinIO ② INSERT status=pending ③ publish 到 Kafka `track.uploads` topic ④ 回 202。
+
+---
+
+### 2. 等 worker 處理 → 看到 status 從 pending 變 ready
+
+```bash
+TRACK_ID="（上面拿到的 id）"
+
+# 馬上查：pending
+curl -s https://localhost/v1/tracks/$TRACK_ID | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])"
+
+# 等 2 秒，worker 從 Kafka 消費並處理
+sleep 2
+
+# 再查：應該是 ready 了
+curl -s https://localhost/v1/tracks/$TRACK_ID | python3 -m json.tool | grep -E "status|duration"
+```
+
+**你應該看到：** `"status": "ready"` 和一個非 0 的 `"duration_ms"`。
+
+**直接看 worker log 確認：**
+```bash
+docker compose logs worker --tail 10
+```
+
+**你應該看到：**
+```
+upload worker: transcoding track xxxx-...
+upload worker: track xxxx-... ready (159909ms)
+```
+
+---
+
+### 3. Redpanda topics — 看到兩個 topic 存在
+
+```bash
+docker exec beatstream-redpanda-1 rpk topic list
+```
+
+**你應該看到：**
+```
+NAME           PARTITIONS  REPLICAS
+play.events    1           1
+track.uploads  1           1
+```
+
+**觸發 play event，看 analytics worker 記錄：**
+```bash
+# 打 stream endpoint 觸發 play event
+curl -sk https://localhost/v1/tracks/aaaa0001-0000-0000-0000-000000000000/stream -o /dev/null
+
+# 看 worker 有沒有消費到
+docker compose logs worker --tail 5
+```
+
+**你應該看到：**
+```
+analytics worker: recorded play for track aaaa0001-...
+```
+
+---
+
+### 4. 驗證 Kafka 解耦效果 — 停掉 worker，upload 還是成功
+
+```bash
+# 停掉 worker
+docker compose stop worker
+
+# 上傳一個 track
+curl -s -X POST https://localhost/v1/tracks \
+  -F "title=No Worker Test" \
+  -F "artist_id=11111111-1111-1111-1111-111111111111" \
+  -F "audio=@/tmp/demo.mp3;type=audio/mpeg" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['id'], d['status'])"
+```
+
+**你應該看到：** 仍然回傳一個 id 和 `pending` — API 不依賴 worker 存活，訊息在 Kafka 裡等著。
+
+```bash
+# 重啟 worker，它會消費積壓的訊息
+docker compose start worker
+sleep 3
+docker compose logs worker --tail 5
+# 看到 "track xxxx ready" — 補處理完了
+```
+
+**這說明了什麼：** Kafka 是 durable message log，不是 in-memory queue。Worker 掛掉再重啟，不會漏訊息。

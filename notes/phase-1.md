@@ -589,3 +589,105 @@ k6 run -e TRACK_ID=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa k6/load.js
 
 **"Why use pre-signed URLs for audio streaming?"**
 > If we proxied audio through the API, 1000 concurrent listeners × 5MB per song = 5GB/s through our servers. Pre-signed URLs let clients fetch audio directly from object storage. The API just does a lightweight DB lookup and generates a signed URL — it never touches the audio bytes. Object storage handles the concurrent reads cheaply because reading is non-destructive: thousands of clients can read the same file simultaneously without locks.
+
+---
+
+## Demo
+
+**前置：** Phase 0 的服務要先跑起來（`make up && make migrate && make seed`）
+
+---
+
+### 1. Redis cache — 看到第一次慢、第二次快
+
+```bash
+# 第一次：cache miss，查 Postgres
+time curl -sk https://localhost/v1/tracks/aaaa0001-0000-0000-0000-000000000000 -o /dev/null
+
+# 第二次：cache hit，從 Redis 直接回
+time curl -sk https://localhost/v1/tracks/aaaa0001-0000-0000-0000-000000000000 -o /dev/null
+```
+
+**你應該看到：** 第一次 ~10–30ms，第二次 ~1–5ms。
+
+**驗證 cache 真的有資料：**
+```bash
+docker exec beatstream-redis-1 redis-cli GET "track:aaaa0001-0000-0000-0000-000000000000" | head -c 100
+```
+
+**你應該看到：** JSON 字串（track 的 metadata）。TTL 1 小時，這段時間內 Postgres 不會被打到。
+
+---
+
+### 2. Rate limiting — 看到 429 Too Many Requests
+
+```bash
+# 連續打 stream endpoint，超過 100 次/分鐘會被擋
+for i in $(seq 1 105); do
+  STATUS=$(curl -sk -o /dev/null -w "%{http_code}" \
+    https://localhost/v1/tracks/aaaa0001-0000-0000-0000-000000000000/stream)
+  echo "req $i: $STATUS"
+done | grep 429 | head -5
+```
+
+**你應該看到：** 第 101 次開始出現 `429 Too Many Requests`。
+
+**驗證 token bucket 在 Redis：**
+```bash
+docker exec beatstream-redis-1 redis-cli KEYS "rate:*" | head -5
+docker exec beatstream-redis-1 redis-cli GET "rate:stream:$(curl -s ifconfig.me)"
+```
+
+---
+
+### 3. 負載均衡 — 看到請求被分散到 3 個 instance
+
+```bash
+# 打 10 次，觀察 X-Request-ID（每個 instance 獨立）
+for i in $(seq 10); do
+  curl -sk -I https://localhost/v1/tracks | grep X-Request-ID
+done
+```
+
+**你應該看到：** 10 個不同的 Request-ID，透過 nginx `least_conn` 分散到 api-1/2/3。
+
+**直接看各 instance log：**
+```bash
+docker compose logs api-1 --tail 5
+docker compose logs api-2 --tail 5
+docker compose logs api-3 --tail 5
+```
+
+**你應該看到：** 三個 instance 都有收到請求。
+
+---
+
+### 4. k6 load test — 看到具體吞吐量數字
+
+```bash
+# 需要安裝 k6：brew install k6
+k6 run k6/load.js
+```
+
+**你應該看到（參考值）：**
+```
+http_req_duration p(95)=11ms
+http_reqs=325009 (1550/s)
+cache hit rate: ~99.997%
+```
+
+**這說明了什麼：** 同樣的 Postgres，加了 Redis 之後 p95 從 ~50ms 降到 11ms，因為 99.997% 的讀取直接打到 Redis，Postgres 只處理真正的 cache miss。
+
+---
+
+### 5. Grafana dashboard — 看到即時 RPS 和 latency 圖表
+
+開啟 http://localhost:3000（admin / admin）→ 選 Beatstream dashboard
+
+**邊跑 k6 邊看：**
+```bash
+k6 run k6/load.js &
+# 打開 Grafana，看到 RPS spike 和 p95 latency 圖形
+```
+
+**你應該看到：** RPS 即時上升、p95 latency 曲線、cache hit rate 接近 100%。

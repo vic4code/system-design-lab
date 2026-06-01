@@ -148,3 +148,101 @@ Real bottleneck ordering: **network bandwidth first** (1Gbps ≈ 25 simultaneous
 
 **"How does MinIO handle thousands of concurrent listeners without running out of memory?"**
 > The OS loads the file into page cache once. Each connection gets its own file descriptor tracking an independent offset — all reading from the same RAM pages. Go goroutines stream in 64KB chunks rather than loading the entire file, so 1000 concurrent listeners of a 5MB track use ~77MB, not 5GB.
+
+---
+
+## Demo
+
+**前置：**
+```bash
+cd beatstream
+make up        # 啟動所有服務
+make migrate   # 跑 migration
+make seed      # 載入範例資料（Radiohead, Portishead 等）
+```
+
+---
+
+### 1. 查 track 清單 → 看到 seed 資料
+
+```bash
+curl -s http://localhost:80/v1/tracks | python3 -m json.tool | head -30
+```
+
+**你應該看到：**
+```json
+{
+  "items": [
+    { "id": "aaaa0001-...", "title": "Creep", "status": "ready", "play_count": 982342 },
+    { "id": "aaaa0002-...", "title": "Karma Police", ... }
+  ],
+  "total": 32
+}
+```
+
+**這說明了什麼：** API → Postgres 的讀取路徑通了。`play_count` 是 denormalized 欄位（快讀），後面會對比 Phase 2 改成非同步更新的版本。
+
+---
+
+### 2. 音訊串流 → 看到 307 redirect，不是直接回傳音訊
+
+```bash
+curl -v http://localhost/v1/tracks/aaaa0001-0000-0000-0000-000000000000/stream 2>&1 | grep -E "< HTTP|Location:"
+```
+
+**你應該看到：**
+```
+< HTTP/1.1 307 Temporary Redirect
+< Location: http://localhost:9000/beatstream-audio/tracks/.../audio?X-Amz-Signature=...
+```
+
+**這說明了什麼：** API 沒有代理音訊資料。它只做了：① 查 DB 拿 `audio_key` ② 叫 MinIO 簽一個 URL ③ 307 redirect。Browser 的 `<audio>` element 直接去 MinIO 拿資料，API 完全不過流量。
+
+---
+
+### 3. 全文搜尋 → 看到 Postgres tsvector 查詢結果
+
+```bash
+curl -s "http://localhost/v1/search?q=karma" | python3 -m json.tool
+```
+
+**你應該看到：**
+```json
+{ "items": [{ "title": "Karma Police", ... }], "total": 2 }
+```
+
+**這說明了什麼：** 沒有 Elasticsearch。Postgres `search_vector TSVECTOR GENERATED ALWAYS AS (...)` 欄位是 computed column，insert/update 時自動維護。`@@` + GIN index 讓全文搜尋走 index scan，不是 full table scan。
+
+---
+
+### 4. 建立 artist + track → 看到資料進 Postgres
+
+```bash
+# 建 artist
+ARTIST=$(curl -s -X POST http://localhost/v1/artists \
+  -H "Content-Type: application/json" \
+  -d '{"name":"My Band"}')
+echo $ARTIST
+
+ARTIST_ID=$(echo $ARTIST | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+# 上傳 track（需要 audio 檔案）
+dd if=/dev/urandom bs=1024 count=100 > /tmp/demo.mp3
+curl -s -X POST http://localhost/v1/tracks \
+  -F "title=Demo Song" \
+  -F "artist_id=$ARTIST_ID" \
+  -F "duration_ms=180000" \
+  -F "audio=@/tmp/demo.mp3;type=audio/mpeg" | python3 -m json.tool
+```
+
+**你應該看到：** `"status": "pending"` → 代表 audio 已上傳到 MinIO，DB record 建立，但尚未被 worker 處理（Phase 2 才會把 worker 加進來）。
+
+---
+
+### 5. MinIO console → 看到 audio 檔案存在
+
+開啟 http://localhost:9001（帳號：minioadmin / minioadmin）
+
+**你應該看到：** `beatstream-audio` bucket 裡有 `tracks/<uuid>/audio` 物件。
+
+**這說明了什麼：** API 拿到 binary 後直接 PUT 到 MinIO（S3-compatible object storage），不存在本機磁碟，這就是 cloud-native storage 的正確做法。
