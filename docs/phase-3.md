@@ -532,30 +532,30 @@ etcd uses Raft consensus: any write requires acknowledgment from more than half 
 
 ## Demo
 
-**前置：**
+**Prerequisites:**
 ```bash
-# 建 kind cluster（只需要一次）
+# Create kind cluster (one-time)
 make k8s-cluster
 
-# Build image 並載入 cluster
+# Build image and load into cluster
 make k8s-load
 
-# 部署所有 manifest
+# Deploy all manifests
 make k8s-deploy
 
-# 等 pods 全部 ready（約 60–120 秒）
+# Wait for all pods to be ready (approximately 60–120 seconds)
 kubectl -n beatstream get pods -w
 ```
 
 ---
 
-### 1. 確認所有 pod 跑起來
+### 1. Confirm all pods are running
 
 ```bash
 kubectl -n beatstream get pods
 ```
 
-**你應該看到：**
+**Expected output:**
 ```
 NAME                      READY   STATUS    RESTARTS
 api-xxxx                  1/1     Running   0
@@ -568,83 +568,83 @@ redis-xxxx                1/1     Running   0
 minio-xxxx                1/1     Running   0
 ```
 
-**這說明了什麼：** K8s 的 control plane 自動做了 scheduling（哪個 pod 跑在哪個 node）、health check、restart。StatefulSet 的 pod name 有固定 suffix（`postgres-0`），Deployment 的 pod name 是 random hash。
+**What this demonstrates:** The K8s control plane handled scheduling (which pod runs on which node), health checks, and restarts automatically. StatefulSet pods have a stable suffix (`postgres-0`); Deployment pods have a random hash.
 
 ---
 
-### 2. HPA — 看到 pod 數量隨 CPU 自動擴展
+### 2. HPA — observe pod count scale automatically with CPU
 
 ```bash
-# 看目前 HPA 狀態
+# Check current HPA status
 kubectl -n beatstream get hpa
 
-# 打壓力（另開一個 terminal）
+# Generate load (open a separate terminal)
 kubectl -n beatstream run load --image=busybox --restart=Never -- \
   sh -c "while true; do wget -qO- http://api/v1/tracks; done"
 
-# 觀察 pod 數量自動增加（需要幾分鐘）
+# Watch pod count increase automatically (takes a few minutes)
 watch kubectl -n beatstream get pods -l app=api
 ```
 
-**你應該看到：** HPA 偵測到 CPU > 60%，從 2 個 pod 自動擴展到最多 10 個。
+**Expected output:** HPA detects CPU > 60% and scales from 2 pods up to a maximum of 10.
 
 ```bash
-# 清掉壓力測試 pod
+# Clean up the load-test pod
 kubectl -n beatstream delete pod load
 ```
 
 ---
 
-### 3. Self-healing — 刪掉一個 pod，看它自動重生
+### 3. Self-healing — delete a pod, observe it automatically respawn
 
 ```bash
-# 找一個 api pod name
+# Find an api pod name
 POD=$(kubectl -n beatstream get pods -l app=api -o name | head -1)
 echo "Killing $POD"
 
-# 刪掉它
+# Delete it
 kubectl -n beatstream delete $POD
 
-# 馬上觀察：K8s 幾秒內補一個新的
+# Watch immediately: K8s replaces it within seconds
 watch kubectl -n beatstream get pods -l app=api
 ```
 
-**你應該看到：** 舊 pod `Terminating`，新 pod `ContainerCreating` → `Running`，整個過程 API 服務不中斷（ALB 自動繞開不健康的 pod）。
+**Expected output:** Old pod shows `Terminating`, new pod goes `ContainerCreating` → `Running`. The API remains uninterrupted throughout (traffic is automatically routed away from the unhealthy pod).
 
-**這說明了什麼：** Deployment 的 `replicas: 3` 是 desired state。K8s control loop 持續比對 actual vs desired，自動補回來。
+**What this demonstrates:** `replicas: 3` in the Deployment is the desired state. The K8s control loop continuously compares actual vs. desired state and self-corrects.
 
 ---
 
-### 4. Rolling update — 零停機部署
+### 4. Rolling update — zero-downtime deploy
 
 ```bash
-# 模擬改了一行 code，rebuild + reload image
+# Simulate a code change: rebuild and reload the image
 make k8s-load
 
-# 觸發 rolling update
+# Trigger a rolling update
 kubectl -n beatstream rollout restart deployment/api
 
-# 邊更新邊打 API，應該不會有 5xx
+# Send requests continuously during the update — no 5xx should appear
 while true; do
   curl -s http://beatstream.local/v1/tracks -o /dev/null -w "%{http_code}\n"
   sleep 0.1
 done
 ```
 
-**你應該看到：** 全程都是 `200`，沒有 `503`。Rolling update 策略是 `maxUnavailable: 0`，代表先啟一個新 pod 確認 healthy 才把舊的關掉。
+**Expected output:** All responses are `200`, no `503`. The rolling update strategy is `maxUnavailable: 0`, meaning a new pod must be confirmed healthy before the old one is terminated.
 
 ---
 
-### 5. Secret vs ConfigMap — 確認 credentials 不在 env 裡明文
+### 5. Secret vs ConfigMap — confirm credentials are not stored as plaintext in env
 
 ```bash
-# 看 configmap（non-sensitive config，明文可見）
+# View configmap (non-sensitive config, plaintext readable)
 kubectl -n beatstream get configmap beatstream-config -o yaml | grep -E "KAFKA|PORT|LOG"
 
-# 看 secret（base64 編碼，不是明文）
+# View secret (base64-encoded, not plaintext)
 kubectl -n beatstream get secret beatstream-secrets -o yaml | grep -E "DATABASE|JWT|REDIS"
 ```
 
-**你應該看到：** ConfigMap 的值是可讀的 string，Secret 的值是 base64 string（`cGFzc3dvcmQ=` 這類）。
+**Expected output:** ConfigMap values are readable strings; Secret values are base64 strings (e.g. `cGFzc3dvcmQ=`).
 
-**這說明了什麼：** Credentials 進 Secret，好處是 ① 可以獨立設定 RBAC（只有特定 ServiceAccount 可以 mount）② 未來可以接 AWS Secrets Manager 或 Vault 替換 backend，app 不用改 code。
+**What this demonstrates:** Storing credentials in Secrets provides two advantages: ① RBAC can be configured independently (only specific ServiceAccounts can mount them) ② the backend can later be replaced with AWS Secrets Manager or Vault without any application code changes.

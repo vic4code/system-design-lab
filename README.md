@@ -33,12 +33,16 @@
 - [Observability](#observability)
 
 **Capstone: Beatstream** _(build it end-to-end)_
-- [Phase 0 — local monolith](#phase-0--local-monolith)
-- [Phase 1 — load balancing & caching](#phase-1--load-balancing--caching)
-- [Phase 2 — async & queues](#phase-2--async--queues)
-- [Phase 3 — kubernetes](#phase-3--kubernetes)
-- [Phase 4 — cloud deployment](#phase-4--cloud-deployment)
-- [Phase 5 — observability](#phase-5--observability)
+- [Quickstart](beatstream/README.md)
+- [Phase 0 — local monolith](docs/phase-0.md)
+- [Phase 1 — load balancing & caching](docs/phase-1.md)
+- [Phase 2 — async & queues](docs/phase-2.md)
+- [Phase 3 — kubernetes](docs/phase-3.md)
+- [Phase 4 — frontend (Next.js)](docs/phase-4.md)
+- [Phase 5 — JWT authentication](docs/phase-5.md)
+- [Phase 6 — security foundations](docs/phase-6.md)
+- [Phase 7 — RBAC + GDPR](docs/phase-7.md)
+- [Phase 8 — AWS cloud deployment](docs/phase-8.md)
 
 **Interview Prep**
 - [Classic questions](#classic-interview-questions)

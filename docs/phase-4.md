@@ -170,72 +170,72 @@ make web-dev
 
 ## Demo
 
-**前置：**
+**Prerequisites:**
 ```bash
-make up && make migrate && make seed   # 後端
-make web-install                        # 安裝 npm 依賴
-make web-dev                            # 前端 dev server（另開 terminal）
+make up && make migrate && make seed   # start backend
+make web-install                        # install npm dependencies
+make web-dev                            # start frontend dev server (separate terminal)
 ```
 
-打開 http://localhost:3001
+Open http://localhost:3001
 
 ---
 
-### 1. 播放音樂 → 看到 HTML5 Audio 直接打 MinIO
+### 1. Play a track — observe HTML5 Audio hitting MinIO directly
 
-打開 Chrome DevTools → Network tab → 點任一首歌的播放鍵
+Open Chrome DevTools → Network tab → click the play button on any track
 
-**你應該看到：**
-- 一個 `GET /v1/tracks/:id/stream` → 回 `307 Redirect`
-- 接著一個 `GET http://localhost:9000/beatstream-audio/...?X-Amz-Signature=...` → 回 `206 Partial Content`（Range request）
+**Expected output:**
+- A `GET /v1/tracks/:id/stream` request returning `307 Redirect`
+- Followed by a `GET http://localhost:9000/beatstream-audio/...?X-Amz-Signature=...` returning `206 Partial Content` (Range request)
 
-**這說明了什麼：** 音訊流量完全不經過 API server，直接走 MinIO。`206 Partial Content` 是 browser 的 Range request 機制，支援 seek（拖曳進度條）。
-
----
-
-### 2. 跨頁面導航 → 看到音樂不中斷
-
-在首頁播放一首歌 → 點上方 Search 連結 → 搜尋 "karma"
-
-**你應該看到：** 音樂繼續播，底部 Player bar 不消失，進度條持續前進。
-
-**這說明了什麼：** `Audio` 物件存在 React Context（`PlayerContext`）裡，Context provider 在 root layout — Next.js App Router 只更換 `{children}`，不 unmount root layout，所以 Audio 物件不被銷毀。
+**What this demonstrates:** Audio traffic bypasses the API server entirely and goes straight to MinIO. `206 Partial Content` is the browser's Range request mechanism — it enables seeking (dragging the progress bar).
 
 ---
 
-### 3. Search debounce → 觀察 Network 請求數量
+### 2. Navigate between pages — observe uninterrupted playback
 
-打開 DevTools Network → 到 /search 頁面 → 快速打 "radiohead"
+Play a track on the home page → click the Search link in the nav → search for "karma"
 
-**你應該看到：** 不是每打一個字就發一個 request，而是停止輸入 300ms 後才發。打 8 個字只有 1–2 個 `GET /v1/search?q=...` 請求。
+**Expected output:** Music keeps playing, the bottom Player bar stays visible, and the progress bar continues advancing.
 
-**這說明了什麼：** 300ms debounce 避免對後端發出大量無意義的中間查詢，降低 DB 和 Redis 的壓力。
-
----
-
-### 4. Upload flow → 看到 status polling
-
-去 /upload 頁面（需要先登入，Phase 5）→ 上傳一個 mp3
-
-**你應該看到：**
-1. 送出後立刻顯示 `status: pending`
-2. 頁面輪詢 `GET /v1/tracks/:id` 每 2 秒
-3. Worker 處理完後顯示 `status: ready`
-
-**DevTools Network 你應該看到：** 每 2 秒一個 GET request，直到拿到 `ready`。
+**What this demonstrates:** The `Audio` object lives in React Context (`PlayerContext`), and the Context provider is in the root layout. Next.js App Router only swaps `{children}` — it does not unmount the root layout, so the Audio object is never destroyed.
 
 ---
 
-### 5. CORS header — 看到 browser 為何能跨 origin 打 API
+### 3. Search debounce — observe the number of Network requests
+
+Open DevTools Network → go to /search → type "radiohead" quickly
+
+**Expected output:** Requests are not fired on every keystroke; instead, a request fires 300ms after you stop typing. Typing 8 characters produces only 1–2 `GET /v1/search?q=...` requests.
+
+**What this demonstrates:** The 300ms debounce prevents flooding the backend with intermediate queries on every keystroke, reducing load on the DB and Redis.
+
+---
+
+### 4. Upload flow — observe status polling
+
+Go to /upload (requires login from Phase 5) → upload an mp3 file
+
+**Expected output:**
+1. Immediately after submission, `status: pending` is shown
+2. The page polls `GET /v1/tracks/:id` every 2 seconds
+3. After the worker finishes processing, `status: ready` appears
+
+**DevTools Network — expected output:** One GET request every 2 seconds until `ready` is received.
+
+---
+
+### 5. CORS header — see why the browser can make cross-origin API calls
 
 ```bash
 curl -sk -I -H "Origin: http://localhost:3001" https://localhost/v1/tracks | grep -i "access-control"
 ```
 
-**你應該看到：**
+**Expected output:**
 ```
 Access-Control-Allow-Origin: http://localhost:3001
 Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
 ```
 
-**這說明了什麼：** browser 的 Same-Origin Policy 預設阻止跨 origin 的 XHR/fetch。`ALLOWED_ORIGINS` env var 控制白名單，production 改成實際 domain，不用 `*`（wildcard 不能帶 credentials）。
+**What this demonstrates:** The browser's Same-Origin Policy blocks cross-origin XHR/fetch by default. The `ALLOWED_ORIGINS` env var controls the allowlist — set it to the real domain in production; avoid `*` (wildcard cannot be used with credentials).

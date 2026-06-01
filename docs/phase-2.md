@@ -201,17 +201,17 @@ Split-brain risk: the DB write succeeds but the Kafka publish fails — the trac
 
 ## Demo
 
-**前置：** `make up && make migrate && make seed`（包含 Redpanda）
+**Prerequisites:** `make up && make migrate && make seed` (includes Redpanda)
 
 ---
 
-### 1. 上傳 track → 看到 202 Accepted + status=pending（非同步）
+### 1. Upload a track — observe 202 Accepted + status=pending (async)
 
 ```bash
-# 先準備一個假的 mp3
+# Prepare a dummy mp3
 dd if=/dev/urandom bs=1024 count=50 > /tmp/demo.mp3
 
-# 需要先有 JWT token（Phase 5），但在 Phase 2 這個 endpoint 是 public
+# JWT token is required in Phase 5; in Phase 2 this endpoint is public
 curl -s -X POST https://localhost/v1/tracks \
   -F "title=Async Demo" \
   -F "artist_id=11111111-1111-1111-1111-111111111111" \
@@ -219,43 +219,43 @@ curl -s -X POST https://localhost/v1/tracks \
   -F "audio=@/tmp/demo.mp3;type=audio/mpeg" | python3 -m json.tool
 ```
 
-**你應該看到：**
+**Expected output:**
 ```json
 {
   "id": "xxxx-...",
   "title": "Async Demo",
-  "status": "pending",   ← 重點：不是 ready，是 pending
-  "duration_ms": 0       ← 還沒被 worker 處理，duration 還是 0
+  "status": "pending",   ← key point: not ready, but pending
+  "duration_ms": 0       ← worker has not processed it yet; duration is still 0
 }
 ```
 
-**這說明了什麼：** API 回 202 不等 transcoding 完成。HTTP handler 做的事：① upload 到 MinIO ② INSERT status=pending ③ publish 到 Kafka `track.uploads` topic ④ 回 202。
+**What this demonstrates:** The API returns 202 without waiting for transcoding to complete. The HTTP handler does: ① upload to MinIO ② INSERT status=pending ③ publish to Kafka `track.uploads` topic ④ return 202.
 
 ---
 
-### 2. 等 worker 處理 → 看到 status 從 pending 變 ready
+### 2. Wait for the worker — observe status transition from pending to ready
 
 ```bash
-TRACK_ID="（上面拿到的 id）"
+TRACK_ID="(id from above)"
 
-# 馬上查：pending
+# Query immediately: pending
 curl -s https://localhost/v1/tracks/$TRACK_ID | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])"
 
-# 等 2 秒，worker 從 Kafka 消費並處理
+# Wait 2 seconds for the worker to consume and process the message
 sleep 2
 
-# 再查：應該是 ready 了
+# Query again: should now be ready
 curl -s https://localhost/v1/tracks/$TRACK_ID | python3 -m json.tool | grep -E "status|duration"
 ```
 
-**你應該看到：** `"status": "ready"` 和一個非 0 的 `"duration_ms"`。
+**Expected output:** `"status": "ready"` and a non-zero `"duration_ms"`.
 
-**直接看 worker log 確認：**
+**Confirm via worker logs:**
 ```bash
 docker compose logs worker --tail 10
 ```
 
-**你應該看到：**
+**Expected output:**
 ```
 upload worker: transcoding track xxxx-...
 upload worker: track xxxx-... ready (159909ms)
@@ -263,56 +263,56 @@ upload worker: track xxxx-... ready (159909ms)
 
 ---
 
-### 3. Redpanda topics — 看到兩個 topic 存在
+### 3. Redpanda topics — confirm both topics exist
 
 ```bash
 docker exec beatstream-redpanda-1 rpk topic list
 ```
 
-**你應該看到：**
+**Expected output:**
 ```
 NAME           PARTITIONS  REPLICAS
 play.events    1           1
 track.uploads  1           1
 ```
 
-**觸發 play event，看 analytics worker 記錄：**
+**Trigger a play event and observe the analytics worker recording it:**
 ```bash
-# 打 stream endpoint 觸發 play event
+# Hit the stream endpoint to trigger a play event
 curl -sk https://localhost/v1/tracks/aaaa0001-0000-0000-0000-000000000000/stream -o /dev/null
 
-# 看 worker 有沒有消費到
+# Check that the worker consumed it
 docker compose logs worker --tail 5
 ```
 
-**你應該看到：**
+**Expected output:**
 ```
 analytics worker: recorded play for track aaaa0001-...
 ```
 
 ---
 
-### 4. 驗證 Kafka 解耦效果 — 停掉 worker，upload 還是成功
+### 4. Verify Kafka decoupling — stop the worker, uploads still succeed
 
 ```bash
-# 停掉 worker
+# Stop the worker
 docker compose stop worker
 
-# 上傳一個 track
+# Upload a track
 curl -s -X POST https://localhost/v1/tracks \
   -F "title=No Worker Test" \
   -F "artist_id=11111111-1111-1111-1111-111111111111" \
   -F "audio=@/tmp/demo.mp3;type=audio/mpeg" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['id'], d['status'])"
 ```
 
-**你應該看到：** 仍然回傳一個 id 和 `pending` — API 不依賴 worker 存活，訊息在 Kafka 裡等著。
+**Expected output:** An id and `pending` are still returned — the API does not depend on the worker being alive; the message waits in Kafka.
 
 ```bash
-# 重啟 worker，它會消費積壓的訊息
+# Restart the worker; it will consume the backlog
 docker compose start worker
 sleep 3
 docker compose logs worker --tail 5
-# 看到 "track xxxx ready" — 補處理完了
+# Shows "track xxxx ready" — backlog processed
 ```
 
-**這說明了什麼：** Kafka 是 durable message log，不是 in-memory queue。Worker 掛掉再重啟，不會漏訊息。
+**What this demonstrates:** Kafka is a durable message log, not an in-memory queue. Messages are not lost when the worker crashes and restarts.

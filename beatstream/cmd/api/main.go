@@ -150,8 +150,10 @@ func main() {
 	tracks := handler.NewTracks(pool, store, rdb, producer)
 	playlists := handler.NewPlaylists(pool)
 	search := handler.NewSearch(pool, rdb)
+	admin := handler.NewAdmin(pool)
 
 	requireAuth := middleware.RequireAuth(jwtSecret)
+	requireAdmin := middleware.RequireRole("admin")
 	auditLog := middleware.AuditLog(pool)
 	loginLimit := middleware.LoginRateLimit(rdb.Client())
 
@@ -162,6 +164,18 @@ func main() {
 		v1.POST("/auth/register", auth.Register)
 		v1.POST("/auth/login", loginLimit, auth.Login)
 		v1.GET("/auth/me", requireAuth, auth.Me)
+
+		// GDPR
+		v1.DELETE("/me", requireAuth, auth.DeleteMe)
+		v1.GET("/me/export", requireAuth, auth.ExportMe)
+
+		// Admin (RBAC: admin role required)
+		adminGroup := v1.Group("/admin", requireAuth, requireAdmin)
+		{
+			adminGroup.GET("/users", admin.ListUsers)
+			adminGroup.DELETE("/users/:id", admin.DeleteUser)
+			adminGroup.GET("/audit-logs", admin.ListAuditLogs)
+		}
 
 		// Artists (read public, write protected)
 		v1.GET("/artists", artists.List)
