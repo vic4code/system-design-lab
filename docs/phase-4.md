@@ -155,7 +155,7 @@ make web-dev
 
 ---
 
-## Interview questions to answer before Phase 5
+## Interview questions
 
 > *"How does the audio player avoid buffering the whole file?"*
 > The pre-signed URL points directly to S3. The browser sends HTTP Range requests natively (`Range: bytes=0-`), so it streams in chunks. S3 supports partial content responses (206). No server proxy means the API doesn't become a bandwidth bottleneck.
@@ -239,3 +239,7 @@ Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
 ```
 
 **What this demonstrates:** The browser's Same-Origin Policy blocks cross-origin XHR/fetch by default. The `ALLOWED_ORIGINS` env var controls the allowlist — set it to the real domain in production; avoid `*` (wildcard cannot be used with credentials).
+
+---
+
+**[← Phase 3 — Kubernetes](phase-3.md) · [Phase 5 — JWT Authentication →](phase-5.md)**

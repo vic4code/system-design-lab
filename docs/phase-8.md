@@ -1,4 +1,4 @@
-# Phase 6 — Cloud Deployment
+# Phase 8 — AWS Cloud Deployment
 
 ## Architecture
 
@@ -196,7 +196,7 @@ Typical results from Taiwan:
 
 ---
 
-## Interview questions to answer before Phase 5
+## Interview questions
 
 > *"Walk me through your AWS architecture. Why did you choose ECS over EKS?"*
 > See design decisions above. Key points: no control plane cost, simpler ops, AWS-native integrations, sufficient for a team that isn't already running K8s at scale.
@@ -206,3 +206,99 @@ Typical results from Taiwan:
 
 > *"Why is the NAT Gateway so expensive?"*
 > NAT charges $0.045/GB processed + $0.045/hr. ECS tasks pulling from ECR, writing to S3, and connecting to MSK all go through NAT. The fix: VPC endpoints for S3, ECR, and MSK so that traffic stays on the AWS backbone (free for gateway endpoints, fixed hourly rate for interface endpoints).
+
+---
+
+## Demo
+
+> Phase 8 deploys to real AWS infrastructure. Run `make infra-plan` first to preview costs before applying.
+
+### 1. Deploy the full stack
+
+```bash
+cd beatstream
+
+# Fill in DB password and region
+cp infra/terraform/terraform.tfvars.example infra/terraform/terraform.tfvars
+# edit terraform.tfvars: set db_password
+
+make infra-init    # terraform init
+make infra-plan    # preview what will be created + estimated cost
+make infra-apply   # create the stack (~15 min — MSK Serverless is the bottleneck)
+```
+
+**Expected output from `infra-plan`:** A list of ~40 resources to create — VPC, subnets, ALB, ECS cluster, RDS, ElastiCache, MSK, CloudFront, S3, IAM roles.
+
+---
+
+### 2. Build and push images to ECR
+
+```bash
+make infra-push    # docker build → ECR login → docker push api + worker images
+make infra-deploy  # force new ECS deployment to pull the latest images
+```
+
+**What this demonstrates:** ECS pulls from ECR (AWS-native registry). No credentials needed in the container — the ECS task role (`iam.tf`) grants `ecr:GetDownloadUrlForLayer` automatically.
+
+---
+
+### 3. Verify the stack is healthy
+
+```bash
+# Get the ALB DNS name
+cd infra/terraform && terraform output alb_dns
+
+# Hit the health endpoint
+curl http://$(terraform output -raw alb_dns)/healthz
+# → {"status":"ok"}
+
+curl http://$(terraform output -raw alb_dns)/ready
+# → {"status":"ready"}
+```
+
+---
+
+### 4. Observe ECS task networking — confirm private subnet isolation
+
+In AWS Console → ECS → Cluster: beatstream → Tasks → click any task
+
+**Expected output:**
+- Subnet: one of the **private** subnets (10.0.10.x or 10.0.11.x)
+- No public IP assigned
+- Security group: `beatstream-api` — inbound only from `beatstream-alb` on port 8080
+
+**What this demonstrates:** ECS tasks have no public IP. All inbound traffic must flow through the ALB. The task role provides AWS API access (S3, MSK) without any static credentials.
+
+---
+
+### 5. Simulate AZ failure
+
+```bash
+# Watch live traffic while forcing tasks out of one AZ
+k6 run k6/load.js &
+
+aws ecs update-service \
+  --cluster beatstream \
+  --service beatstream-api \
+  --placement-constraints '[{"type":"memberOf","expression":"attribute:ecs.availability-zone != ap-northeast-1a"}]' \
+  --region ap-northeast-1
+```
+
+**Expected output:** ALB detects unhealthy tasks (3 failed health checks × 30s ≈ 90s), drains connections, routes to the surviving AZ. k6 should show p99 latency spike but **zero HTTP errors**.
+
+---
+
+### 6. Tear down
+
+```bash
+# Empty the S3 bucket first (Terraform won't delete non-empty buckets)
+aws s3 rm s3://$(cd infra/terraform && terraform output -raw audio_bucket) --recursive
+
+make infra-destroy
+```
+
+> **Cost reminder:** Stop the stack when not in use. The ALB (~$20/mo), NAT Gateway (~$35/mo), and MSK base fee (~$8/mo) run continuously.
+
+---
+
+**[← Phase 7 — RBAC + GDPR](phase-7.md) · [Back to Beatstream README →](../beatstream/README.md)**

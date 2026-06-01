@@ -239,3 +239,7 @@ curl -sk -X POST https://localhost/v1/auth/register \
 **Expected output:** `"terms_version": 2`
 
 **What this demonstrates:** When you update your privacy policy (v2, v3, …), you can query which users have not yet consented to the new version and require them to re-consent or restrict their access.
+
+---
+
+**[← Phase 6 — Security Foundations](phase-6.md) · [Phase 8 — AWS Cloud Deployment →](phase-8.md)**
