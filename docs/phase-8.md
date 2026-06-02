@@ -50,21 +50,150 @@ aws sts get-caller-identity
 
 ## Resource inventory (55 resources)
 
-`terraform plan` creates the following:
+`terraform plan` creates the following. Each resource maps to a real AWS service — here's what it does and why we chose it.
 
-| Category | Resources |
-|----------|-----------|
-| Networking | VPC (10.0.0.0/16), 2 public + 2 private subnets, NAT Gateway, IGW, route tables |
-| Security | 6 Security Groups: ALB, API, Worker, RDS, Redis, MSK |
-| Compute | ECS Cluster, 2 Task Definitions (API + Worker), 2 ECS Services |
-| Database | Aurora PostgreSQL Serverless v2 (0.5–4 ACUs) |
-| Cache | ElastiCache Redis (cache.t4g.micro) |
-| Messaging | MSK Serverless (SASL/IAM auth) |
-| Storage | S3 bucket (`beatstream-audio-dev-<account-id>`) |
-| CDN | CloudFront distribution (OAC for S3, pass-through for ALB) |
-| Load Balancer | ALB + Target Group (health check on :8080/health) |
-| Container Registry | 2 ECR repos: `beatstream/api`, `beatstream/worker` |
-| IAM | ECS execution role + task role (S3 + MSK permissions) |
+### Networking (`vpc.tf`)
+
+| Resource | What it does | Why |
+|----------|-------------|-----|
+| **VPC** (10.0.0.0/16) | An isolated virtual network — all resources live inside it. Think of it as your own private data center in AWS. | Without a VPC, your database and cache would be exposed to the internet. |
+| **Public subnets** (×2, one per AZ) | Subnets where resources CAN have public IPs. Only the ALB and NAT Gateway live here. | The ALB must be internet-facing to receive user traffic. |
+| **Private subnets** (×2, one per AZ) | Subnets with NO public IPs. ECS tasks, RDS, Redis, and MSK live here. | Defense in depth — even if a container is compromised, it can't be reached from the internet directly. |
+| **Internet Gateway** | Connects the VPC to the public internet (for public subnets). | Without it, nothing in the VPC can reach the outside world. |
+| **NAT Gateway** (single AZ) | Lets private-subnet resources (ECS) make outbound requests (pull images, call AWS APIs) without being publicly accessible. | ECS tasks need to pull from ECR and write to S3, but should NOT be directly reachable. Trade-off: single NAT saves ~$32/mo vs one per AZ. |
+| **Route tables** (public + private) | Routing rules: public → internet gateway, private → NAT gateway. | Ensures traffic flows through the correct path based on subnet type. |
+
+**Key insight:** Public subnet ≠ "everything is public." Only resources you explicitly place there (ALB) get public IPs. The private subnet resources talk to the internet *through* NAT — outbound only.
+
+### Security (`security_groups.tf`)
+
+Security groups are stateful firewalls attached to each resource. Traffic is denied by default — you explicitly allow what's needed.
+
+| Resource | Inbound allows | Why this restriction |
+|----------|---------------|---------------------|
+| **SG: ALB** | Port 80/443 from anywhere (0.0.0.0/0) | The load balancer is the only public entry point. |
+| **SG: API** | Port 8080 from ALB only | API containers are NOT directly reachable — all traffic must go through ALB. |
+| **SG: Worker** | No inbound (egress only) | Workers pull from Kafka — nothing needs to call into them. |
+| **SG: RDS** | Port 5432 from API + Worker | Only application containers can connect to the database. |
+| **SG: Redis** | Port 6379 from API only | Only the API uses cache — the worker doesn't need it. |
+| **SG: MSK** | Port 9098 from API + Worker | Kafka port with IAM auth. Both API (producer) and Worker (consumer) need access. |
+
+**Key insight:** This creates a layered chain: `Internet → ALB → API → {RDS, Redis, MSK} ← Worker`. An attacker who somehow reaches the API container still can't connect to Redis from there unless they're on port 6379 from the API security group.
+
+### Compute (`ecs.tf`)
+
+| Resource | What it does | Why ECS Fargate |
+|----------|-------------|-----------------|
+| **ECS Cluster** | Logical grouping of services. No servers to manage. | Fargate = serverless containers. AWS handles the underlying EC2 instances. You just define CPU/memory. |
+| **Task Definition: API** (0.5 vCPU, 1GB) | Blueprint for the API container — image, env vars, secrets, health check, ports. | Declares what the container needs. Secrets (DB password, Kafka brokers) come from SSM at startup — never baked into the image. |
+| **Task Definition: Worker** (0.25 vCPU, 512MB) | Blueprint for the worker container — same structure, lower resources. | Worker just consumes Kafka and writes to DB/S3 — doesn't serve HTTP traffic, needs less CPU. |
+| **ECS Service: API** (desired_count=2) | Keeps 2 API tasks running across 2 AZs. Registers with ALB. Auto-restarts on crash. | 2 tasks = HA. If one AZ dies, the other keeps serving. Circuit breaker auto-rolls back bad deploys. |
+| **ECS Service: Worker** (desired_count=1) | Keeps 1 worker task running. | Only one consumer needed at this scale. Kafka handles redelivery if the task crashes. |
+| **CloudWatch Log Groups** (7-day retention) | Collects stdout/stderr from containers. | You need logs to debug. 7 days keeps costs low for a lab. |
+
+**Why Fargate over EC2:** No AMI updates, no instance patching, no capacity planning. You pay per second of vCPU+memory used. For a lab with variable traffic, this is cheaper and simpler than managing EC2 instances.
+
+### Database (`rds.tf`)
+
+| Resource | What it does | Why Aurora Serverless v2 |
+|----------|-------------|--------------------------|
+| **Aurora PostgreSQL Cluster** (Serverless v2) | Managed PostgreSQL that auto-scales compute between 0.5–4 ACUs based on load. | At idle (most of the time for a lab), it runs at 0.5 ACU (~$50/mo). Under load it scales up in seconds — no manual intervention. Regular RDS would require choosing and paying for a fixed instance size. |
+| **Aurora Instance** (db.serverless) | The actual compute node inside the cluster. | Aurora separates compute from storage. The instance scales; the storage is independent. |
+| **DB Subnet Group** | Tells RDS which subnets to deploy into (private only). | Forces the database into private subnets — no public access possible. |
+| **SSM Parameter** (/beatstream/db_password) | Stores the DB password as a SecureString in AWS Systems Manager. | ECS reads this at container startup. The password never appears in environment variables or Docker images — only in SSM (encrypted at rest with KMS). |
+
+**Why not plain RDS PostgreSQL:** For a lab that's idle 90% of the time, Serverless v2 avoids paying for a `db.t3.medium` ($60/mo) that sits at 2% CPU utilization. The trade-off is a ~1s cold-start latency spike when scaling from minimum.
+
+### Cache (`elasticache.tf`)
+
+| Resource | What it does | Why ElastiCache Redis |
+|----------|-------------|----------------------|
+| **ElastiCache Redis** (cache.t4g.micro) | In-memory key-value store — caches track metadata and search results. Same role as local Redis in Phase 1. | Managed Redis = AWS handles patching, failover (if replicated), backups. `t4g.micro` is the cheapest Graviton instance (~$12/mo). |
+| **ElastiCache Subnet Group** | Places Redis in private subnets. | Same reason as RDS — no public access. |
+
+**Why single-node for a lab:** A replication group (primary + replica) costs 2x but adds automatic failover. For a lab, the API's cache-aside pattern means a Redis crash just causes cache misses — the app still works (fail-open design from Phase 1).
+
+### Messaging (`msk.tf`)
+
+| Resource | What it does | Why MSK Serverless |
+|----------|-------------|-------------------|
+| **MSK Serverless Cluster** | Managed Apache Kafka — handles play events and upload processing queues. Replaces Redpanda from local dev. | Serverless = no brokers to manage, auto-scales, pay per data. Same Kafka protocol as local Redpanda — the Go code works unchanged. |
+| **SSM Parameter** (/beatstream/kafka_brokers) | Stores the MSK bootstrap broker endpoints. | MSK doesn't expose brokers as a Terraform output. A `null_resource` runs `aws kafka get-bootstrap-brokers` after creation and writes the result to SSM. |
+| **null_resource** (fetch_kafka_brokers) | A one-time script that fetches MSK broker addresses and stores them in SSM. | Workaround for Terraform's limitation — MSK Serverless broker addresses aren't available as attributes. |
+
+**Why MSK over self-managed Kafka on ECS:** Operating Kafka (ZooKeeper/KRaft, replication, partition rebalancing) is a full-time job. MSK Serverless handles all of it. Trade-off: ~$8/mo base cost vs $0 for Redpanda in Docker Compose, but zero operational burden.
+
+### Storage (`s3.tf`)
+
+| Resource | What it does | Why S3 |
+|----------|-------------|--------|
+| **S3 Bucket** (beatstream-audio-dev-{account_id}) | Stores uploaded audio files. Replaces MinIO from local dev. | S3 is the standard object store — 99.999999999% durability, effectively infinite capacity, ~$0.023/GB/mo. Account ID in the name guarantees global uniqueness. |
+| **Public Access Block** | Blocks ALL public access at the bucket level — even if someone accidentally adds a public policy. | Belt-and-suspenders security. Audio is served through CloudFront OAC, never directly from S3. |
+| **Versioning** | Keeps old versions of objects when overwritten. | Protects against accidental deletion or corruption. Can always roll back to a previous version. |
+| **Lifecycle Rules** | (1) Aborts stuck multipart uploads after 7 days. (2) Moves tracks not accessed in 90 days to S3 Infrequent Access (40% cheaper). | Multipart uploads that never complete waste storage silently. IA tiering mirrors real streaming services where most tracks are rarely played (long tail). |
+
+### CDN (`cloudfront.tf`)
+
+| Resource | What it does | Why CloudFront |
+|----------|-------------|----------------|
+| **CloudFront Distribution** | Global CDN with 400+ edge locations. Routes `/audio/*` to S3, everything else to ALB. | Users in Taiwan hit a Tokyo PoP (~3ms) instead of going through the full ALB path. For users in other regions, latency drops from 180ms to <10ms for cached audio. |
+| **Origin Access Control (OAC)** | Signs requests from CloudFront to S3 with SigV4. | The S3 bucket is fully private (no public access). OAC is the only way CloudFront can read from it — and only THIS distribution is allowed (condition on ARN). |
+| **Cache Behaviors** | `/audio/*` → aggressive 24h cache (audio is immutable). Default → no cache (API is dynamic). | Audio files never change after upload (key includes track ID). API responses change per request — caching them would serve stale data. |
+| **S3 Bucket Policy** | Grants `s3:GetObject` to CloudFront's service principal, scoped to this distribution's ARN. | Without this policy, CloudFront gets 403 from S3 even with OAC configured. The ARN condition prevents other distributions from reading your bucket. |
+
+**Why PriceClass_200:** Covers US, Europe, and Asia (including Taiwan and Japan). PriceClass_All adds South America and Africa — not needed here, costs more per request.
+
+### Load Balancer (`alb.tf`)
+
+| Resource | What it does | Why ALB |
+|----------|-------------|---------|
+| **Application Load Balancer** | Distributes HTTP traffic across ECS API tasks. Health-checks each task every 30s. | ALB operates at Layer 7 (HTTP) — it can route by path, inspect headers, and terminate TLS. NLB (Layer 4) is cheaper but can't do path-based routing or HTTP health checks. |
+| **Target Group** (ip type, :8080/health) | Tracks healthy ECS tasks. Fargate uses IP targeting because tasks don't have fixed instance IPs. | Health check on `/health` means ALB only sends traffic to tasks that are ready. If a task is starting up or crashing, it gets no traffic. |
+| **HTTP Listener** (port 80) | Forwards all incoming HTTP requests to the target group. | For a lab, HTTP is fine. Production would add an HTTPS listener with ACM cert and redirect HTTP→HTTPS. |
+
+### Container Registry (`ecr.tf`)
+
+| Resource | What it does | Why ECR |
+|----------|-------------|---------|
+| **ECR Repos** (beatstream/api, beatstream/worker) | Private Docker registries for your images. ECS pulls from here at deploy time. | ECR is the native registry for ECS — no extra auth setup. Images are scanned for vulnerabilities on push. |
+| **Lifecycle Policy** | Deletes untagged images after 10 builds. | Without this, every `docker push` leaves old untagged images that accumulate storage costs forever. |
+
+### IAM (`iam.tf`)
+
+| Resource | What it does | Why two roles |
+|----------|-------------|---------------|
+| **ECS Execution Role** | Used by the ECS **agent** (not your code) to: pull images from ECR, fetch secrets from SSM, write logs to CloudWatch. | Separation of concerns. Your container code never sees ECR credentials — the ECS platform handles image pulling. |
+| **ECS Task Role** | Used by your **application code** to: read/write S3, connect to MSK with IAM auth. | This is what `aws.NewConfig()` in your Go code picks up automatically. No access keys needed — temporary credentials are rotated by ECS every hour. |
+
+**Key insight:** Two roles because the ECS agent and your app need different permissions. The execution role is broad (ECR, SSM, CloudWatch) but only used during startup. The task role is specific (S3 + MSK) and used at runtime. Least-privilege principle.
+
+---
+
+### How it all connects (request flow)
+
+```
+User in Taiwan
+  │
+  ▼
+CloudFront (Tokyo PoP)
+  │
+  ├── GET /audio/track-123.mp3
+  │     → S3 (OAC signed request) → cached at edge for 24h
+  │
+  └── POST /v1/tracks
+        → ALB (public subnet)
+           → ECS API task (private subnet)
+              ├── writes metadata → Aurora (private subnet, port 5432)
+              ├── uploads file → S3 (via task role, no keys)
+              ├── publishes event → MSK (IAM auth, port 9098)
+              └── invalidates cache → Redis (port 6379)
+                       │
+                       ▼
+              ECS Worker task (private subnet)
+              ├── consumes from MSK
+              ├── processes upload
+              └── updates DB status → Aurora
+```
 
 ---
 
