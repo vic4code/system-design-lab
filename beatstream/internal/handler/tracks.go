@@ -127,6 +127,10 @@ func (h *Tracks) Get(c *gin.Context) {
 
 func (h *Tracks) Stream(c *gin.Context) {
 	id := c.Param("id")
+	if _, err := uuid.Parse(id); err != nil {
+		c.JSON(http.StatusBadRequest, apiError("invalid track id"))
+		return
+	}
 	quality := c.DefaultQuery("quality", "128")
 
 	// Try adaptive bitrate: look up the requested quality in track_formats.

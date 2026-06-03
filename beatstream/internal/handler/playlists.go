@@ -175,9 +175,17 @@ func (h *Playlists) Delete(c *gin.Context) {
 		return
 	}
 
-	_, err := h.db.Exec(c.Request.Context(), `DELETE FROM playlists WHERE id = $1`, id)
+	userID, _ := c.Get("user_id")
+	uid, _ := userID.(string)
+
+	tag, err := h.db.Exec(c.Request.Context(),
+		`DELETE FROM playlists WHERE id = $1 AND owner_id = $2`, id, uid)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, apiError("failed to delete playlist"))
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		c.JSON(http.StatusNotFound, apiError("playlist not found"))
 		return
 	}
 	c.Status(http.StatusNoContent)

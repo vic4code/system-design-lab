@@ -46,27 +46,40 @@ func (h *Search) Search(c *gin.Context) {
 	metrics.CacheMisses.WithLabelValues("search").Inc()
 
 	// If OpenSearch is available, use fuzzy multi-field search.
+	// On success we still query PostgreSQL for the full track data to ensure
+	// correct artist_id and all fields are populated.
 	if h.os != nil {
 		results, err := h.os.Search(c.Request.Context(), q, 20)
-		if err == nil {
-			resp := searchResponse{
-				Items: make([]trackRow, 0, len(results)),
-				Total: len(results),
-			}
+		if err == nil && len(results) > 0 {
+			ids := make([]string, 0, len(results))
 			for _, r := range results {
-				resp.Items = append(resp.Items, trackRow{
-					ID:       r.ID,
-					Title:    r.Title,
-					ArtistID: r.ArtistName,
-				})
+				ids = append(ids, r.ID)
 			}
-			if data, err := json.Marshal(resp); err == nil {
-				h.cache.Set(c.Request.Context(), cacheKey, string(data), time.Minute)
+			rows, err := h.db.Query(c.Request.Context(), `
+				SELECT id, title, artist_id, duration_ms, release_date::TEXT, play_count, status, created_at
+				FROM tracks WHERE id = ANY($1)`, ids)
+			if err == nil {
+				defer rows.Close()
+				var items []trackRow
+				for rows.Next() {
+					var t trackRow
+					if err := rows.Scan(&t.ID, &t.Title, &t.ArtistID, &t.DurationMs,
+						&t.ReleaseDate, &t.PlayCount, &t.Status, &t.CreatedAt); err == nil {
+						items = append(items, t)
+					}
+				}
+				if items == nil {
+					items = []trackRow{}
+				}
+				resp := searchResponse{Items: items, Total: len(items)}
+				if data, err := json.Marshal(resp); err == nil {
+					h.cache.Set(c.Request.Context(), cacheKey, string(data), time.Minute)
+				}
+				c.JSON(http.StatusOK, resp)
+				return
 			}
-			c.JSON(http.StatusOK, resp)
-			return
 		}
-		// OpenSearch failed — fall through to PostgreSQL tsvector.
+		// OpenSearch failed or empty — fall through to PostgreSQL tsvector.
 	}
 
 	rows, err := h.db.Query(c.Request.Context(), `

@@ -61,7 +61,8 @@ func (h *Favorites) List(c *gin.Context) {
 		SELECT t.id, t.title, t.artist_id, t.duration_ms, t.release_date::TEXT, t.play_count, t.status, t.created_at
 		FROM favorites f JOIN tracks t ON t.id = f.track_id
 		WHERE f.user_id = $1
-		ORDER BY f.created_at DESC`, uid)
+		ORDER BY f.created_at DESC
+		LIMIT 200`, uid)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, apiError("failed to list favorites"))
 		return
