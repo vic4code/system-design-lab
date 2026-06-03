@@ -128,3 +128,28 @@ export const removeTrackFromPlaylist = (playlistId: string, trackId: string) =>
   req<void>(`/v1/playlists/${playlistId}/tracks/${trackId}`, {
     method: "DELETE",
   });
+
+export const deletePlaylist = (id: string) =>
+  req<void>(`/v1/playlists/${id}`, {
+    method: "DELETE",
+  });
+
+// ─── Favorites ─────────────────────────────────────────────────────────────────
+
+export const listFavorites = () =>
+  req<{ items: Track[]; total: number }>(`/v1/favorites`);
+
+export const getFavoriteIDs = () =>
+  req<{ ids: string[] }>(`/v1/favorites/ids`);
+
+export const addFavorite = (trackId: string) =>
+  req<void>(`/v1/favorites`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ track_id: trackId }),
+  });
+
+export const removeFavorite = (trackId: string) =>
+  req<void>(`/v1/favorites/${trackId}`, {
+    method: "DELETE",
+  });

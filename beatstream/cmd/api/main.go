@@ -166,6 +166,7 @@ func main() {
 	playlists := handler.NewPlaylists(pool)
 	searchHandler := handler.NewSearch(pool, rdb, osClient)
 	recs := handler.NewRecommendations(pool, rdb)
+	favorites := handler.NewFavorites(pool)
 	admin := handler.NewAdmin(pool)
 
 	requireAuth := middleware.RequireAuth(jwtSecret)
@@ -211,12 +212,19 @@ func main() {
 		v1.GET("/playlists", playlists.List)
 		v1.GET("/playlists/:id", playlists.Get)
 		v1.POST("/playlists", requireAuth, playlists.Create)
+		v1.DELETE("/playlists/:id", requireAuth, playlists.Delete)
 		v1.GET("/playlists/:id/tracks", playlists.ListTracks)
 		v1.POST("/playlists/:id/tracks", requireAuth, playlists.AddTrack)
 		v1.DELETE("/playlists/:id/tracks/:track_id", requireAuth, playlists.RemoveTrack)
 
 		v1.GET("/search", searchHandler.Search)
 		v1.GET("/search/autocomplete", searchHandler.Autocomplete)
+
+		// Favorites
+		v1.GET("/favorites", requireAuth, favorites.List)
+		v1.GET("/favorites/ids", requireAuth, favorites.IDs)
+		v1.POST("/favorites", requireAuth, favorites.Add)
+		v1.DELETE("/favorites/:track_id", requireAuth, favorites.Remove)
 
 		// Recommendations
 		v1.GET("/recommendations/top", recs.TopTracks)

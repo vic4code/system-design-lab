@@ -54,7 +54,7 @@ export default function HomePage() {
 
           <div>
             {tracks.map((t, i) => (
-              <TrackRow key={t.id} track={t} index={i + 1} />
+              <TrackRow key={t.id} track={t} index={i + 1} queue={tracks} />
             ))}
           </div>
         </div>
