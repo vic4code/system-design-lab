@@ -1,6 +1,7 @@
 .PHONY: run build test migrate up down logs \
         k8s-cluster k8s-load k8s-deploy k8s-status k8s-delete \
         infra-init infra-plan infra-apply infra-push infra-deploy infra-destroy \
+        infra-diagram \
         certs certs-trust \
         web-install web-dev
 
@@ -128,6 +129,11 @@ infra-deploy:
 # Tear down everything (will NOT delete the S3 bucket if it has objects — drain first)
 infra-destroy:
 	cd $(TERRAFORM_DIR) && terraform destroy
+
+# Generate architecture diagram (requires: pip install diagrams, brew install graphviz)
+infra-diagram:
+	cd infra && python3 architecture.py
+	@echo "Generated infra/architecture.png"
 
 # ── Phase 6: Security ─────────────────────────────────────────────────────────
 

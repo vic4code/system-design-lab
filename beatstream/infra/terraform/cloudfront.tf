@@ -8,9 +8,10 @@ resource "aws_cloudfront_origin_access_control" "s3" {
 }
 
 resource "aws_cloudfront_distribution" "main" {
-  enabled     = true
-  price_class = "PriceClass_200" # US + Europe + Asia (covers Taiwan, Japan)
-  comment     = "beatstream CDN — audio files + API"
+  enabled         = true
+  price_class     = "PriceClass_200" # US + Europe + Asia (covers Taiwan, Japan)
+  comment         = "beatstream CDN — audio files + API"
+  web_acl_id      = aws_wafv2_web_acl.main.arn
 
   # Origin 1: S3 bucket (audio files)
   origin {
