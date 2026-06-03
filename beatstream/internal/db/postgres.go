@@ -37,6 +37,7 @@ func Migrate(pool *pgxpool.Pool) error {
 		migrationTrackStatus,
 		migrationUsers,
 		migrationAuditLogs,
+		migrationRBACGDPR,
 		migrationTrackFormats,
 	}
 	for _, m := range migrations {
@@ -145,6 +146,13 @@ CREATE INDEX IF NOT EXISTS audit_logs_user_id_idx    ON audit_logs(user_id);
 CREATE INDEX IF NOT EXISTS audit_logs_created_at_idx ON audit_logs(created_at DESC);
 CREATE INDEX IF NOT EXISTS audit_logs_action_idx     ON audit_logs(action);
 CREATE INDEX IF NOT EXISTS audit_logs_ip_idx         ON audit_logs(ip_address);
+`
+
+const migrationRBACGDPR = `
+ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_version INT NOT NULL DEFAULT 1;
+CREATE INDEX IF NOT EXISTS users_active_email_idx ON users(email) WHERE deleted_at IS NULL;
 `
 
 const migrationTrackFormats = `
