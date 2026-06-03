@@ -5,17 +5,18 @@
 
 set -euo pipefail
 
-API="http://localhost:80/v1"
+API="https://localhost/v1"
+CURL="curl -sk"
 
 echo "==> Registering demo user..."
-TOKEN=$(curl -sf "$API/auth/register" \
+TOKEN=$($CURL "$API/auth/register" \
   -H "Content-Type: application/json" \
   -d '{"email":"demo@beatstream.io","password":"demo1234","name":"Demo User"}' \
   | python3 -c "import json,sys; print(json.load(sys.stdin).get('token',''))" 2>/dev/null || true)
 
 if [ -z "$TOKEN" ]; then
   echo "    User might already exist, logging in..."
-  TOKEN=$(curl -sf "$API/auth/login" \
+  TOKEN=$($CURL "$API/auth/login" \
     -H "Content-Type: application/json" \
     -d '{"email":"demo@beatstream.io","password":"demo1234"}' \
     | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
@@ -45,7 +46,7 @@ for i, track in enumerate(tracks, 1):
     # Create artist if not cached
     if artist_name not in artists_cache:
         result = subprocess.run([
-            'curl', '-sf', f'{api}/artists',
+            'curl', '-sk', f'{api}/artists',
             '-H', f'Authorization: Bearer {token}',
             '-H', 'Content-Type: application/json',
             '-d', json.dumps({'name': artist_name})
@@ -57,7 +58,7 @@ for i, track in enumerate(tracks, 1):
         except (json.JSONDecodeError, KeyError):
             # Artist might already exist, try to find it
             result2 = subprocess.run([
-                'curl', '-sf', f'{api}/artists'
+                'curl', '-sk', f'{api}/artists'
             ], capture_output=True, text=True)
             try:
                 all_artists = json.loads(result2.stdout)
@@ -77,7 +78,7 @@ for i, track in enumerate(tracks, 1):
 
     # Upload track
     result = subprocess.run([
-        'curl', '-sf', f'{api}/tracks',
+        'curl', '-sk', f'{api}/tracks',
         '-H', f'Authorization: Bearer {token}',
         '-F', f'title={title}',
         '-F', f'artist_id={artist_id}',

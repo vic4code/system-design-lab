@@ -234,10 +234,8 @@ services:
     volumes:
       - miniodata:/data
     ports:
-      - "9001:9001"  # MinIO console — debug access only
-    # Port 9000 (S3 API) intentionally not exposed to host.
-    # Pre-signed URLs use localhost:9000 only because S3_PRESIGN_ENDPOINT=http://localhost:9000;
-    # in production this points to CloudFront/S3 directly.
+      - "9000:9000"  # S3 API — needed for browser pre-signed URL playback
+      - "9001:9001"  # MinIO console
     networks:
       - data
     restart: unless-stopped

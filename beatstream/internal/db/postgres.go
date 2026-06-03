@@ -38,6 +38,7 @@ func Migrate(pool *pgxpool.Pool) error {
 		migrationUsers,
 		migrationAuditLogs,
 		migrationRBACGDPR,
+		migrationFavorites,
 		migrationTrackFormats,
 	}
 	for _, m := range migrations {
@@ -153,6 +154,17 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_version INT NOT NULL DEFAULT 1;
 CREATE INDEX IF NOT EXISTS users_active_email_idx ON users(email) WHERE deleted_at IS NULL;
+`
+
+const migrationFavorites = `
+CREATE TABLE IF NOT EXISTS favorites (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    track_id   UUID NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(user_id, track_id)
+);
+CREATE INDEX IF NOT EXISTS favorites_user_idx ON favorites(user_id, created_at DESC);
 `
 
 const migrationTrackFormats = `

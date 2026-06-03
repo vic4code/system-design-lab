@@ -168,6 +168,21 @@ func (h *Playlists) AddTrack(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+func (h *Playlists) Delete(c *gin.Context) {
+	id := c.Param("id")
+	if _, err := uuid.Parse(id); err != nil {
+		c.JSON(http.StatusBadRequest, apiError("invalid playlist id"))
+		return
+	}
+
+	_, err := h.db.Exec(c.Request.Context(), `DELETE FROM playlists WHERE id = $1`, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, apiError("failed to delete playlist"))
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
 func (h *Playlists) RemoveTrack(c *gin.Context) {
 	id := c.Param("id")
 	trackID := c.Param("track_id")

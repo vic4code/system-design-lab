@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { usePlayer } from "@/context/PlayerContext";
 
 function fmt(sec: number) {
@@ -32,8 +33,56 @@ function VolumeIcon() {
   );
 }
 
+function VolumeMuteIcon() {
+  return (
+    <svg viewBox="0 0 16 16" fill="currentColor" className="w-4 h-4">
+      <path d="M13.86 5.47a.75.75 0 0 0-1.061 0l-1.47 1.47-1.47-1.47A.75.75 0 0 0 8.8 6.53L10.269 8l-1.47 1.47a.75.75 0 1 0 1.06 1.06l1.47-1.47 1.47 1.47a.75.75 0 0 0 1.06-1.06L12.39 8l1.47-1.47a.75.75 0 0 0 0-1.06z" />
+      <path d="M10.116 1.5A.75.75 0 0 0 8.991.85l-6.925 4a3.642 3.642 0 0 0-1.33 4.967 3.639 3.639 0 0 0 1.33 1.332l6.925 4a.75.75 0 0 0 1.125-.649v-13a.75.75 0 0 0-.375-.65zm-1.5 1.3v10.4l-5.8-3.35a2.139 2.139 0 0 1 0-3.7l5.8-3.35z" />
+    </svg>
+  );
+}
+
+function VolumeControl({ volume, setVolume }: { volume: number; setVolume: (v: number) => void }) {
+  const [prevVolume, setPrevVolume] = useState(0.7);
+  const isMuted = volume === 0;
+
+  const toggleMute = () => {
+    if (isMuted) {
+      setVolume(prevVolume || 0.7);
+    } else {
+      setPrevVolume(volume);
+      setVolume(0);
+    }
+  };
+
+  return (
+    <div className="w-56 flex items-center justify-end gap-2">
+      <button onClick={toggleMute} className="text-muted hover:text-white transition-colors">
+        {isMuted ? <VolumeMuteIcon /> : <VolumeIcon />}
+      </button>
+      <div
+        className="w-24 h-1 bg-surface-3 rounded-full relative group cursor-pointer"
+        onClick={(e) => {
+          const rect = e.currentTarget.getBoundingClientRect();
+          const v = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+          setVolume(v);
+        }}
+      >
+        <div
+          className="h-full bg-muted group-hover:bg-accent rounded-full transition-colors"
+          style={{ width: `${volume * 100}%` }}
+        />
+        <div
+          className="absolute top-1/2 -translate-y-1/2 w-3 h-3 bg-white rounded-full opacity-0 group-hover:opacity-100 transition-opacity"
+          style={{ left: `calc(${volume * 100}% - 6px)` }}
+        />
+      </div>
+    </div>
+  );
+}
+
 export default function Player() {
-  const { track, isPlaying, progress, currentTime, duration, pause, resume, seek } =
+  const { track, isPlaying, progress, currentTime, duration, pause, resume, seek, next, prev, volume, setVolume } =
     usePlayer();
 
   return (
@@ -61,7 +110,7 @@ export default function Player() {
       <div className="flex flex-col items-center gap-2 flex-1 max-w-[45%]">
         <div className="flex items-center gap-5">
           {/* Prev */}
-          <button className="text-muted hover:text-white transition-colors" disabled={!track}>
+          <button onClick={prev} className="text-muted hover:text-white transition-colors" disabled={!track}>
             <PrevIcon />
           </button>
 
@@ -83,7 +132,7 @@ export default function Player() {
           </button>
 
           {/* Next */}
-          <button className="text-muted hover:text-white transition-colors" disabled={!track}>
+          <button onClick={next} className="text-muted hover:text-white transition-colors" disabled={!track}>
             <NextIcon />
           </button>
         </div>
@@ -114,15 +163,7 @@ export default function Player() {
       </div>
 
       {/* Right: volume */}
-      <div className="w-56 flex items-center justify-end gap-2">
-        <button className="text-muted hover:text-white transition-colors">
-          <VolumeIcon />
-        </button>
-        <div className="w-24 h-1 bg-surface-3 rounded-full relative group cursor-pointer">
-          <div className="h-full w-2/3 bg-muted group-hover:bg-accent rounded-full transition-colors" />
-          <div className="absolute top-1/2 -translate-y-1/2 w-3 h-3 bg-white rounded-full opacity-0 group-hover:opacity-100 transition-opacity" style={{ left: "calc(66.67% - 6px)" }} />
-        </div>
-      </div>
+      <VolumeControl volume={volume} setVolume={setVolume} />
     </div>
   );
 }
