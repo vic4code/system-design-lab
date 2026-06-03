@@ -42,5 +42,4 @@ k6_results/
 # The cert (.crt) is safe to commit; the key (.key) is not.
 beatstream/nginx/certs/*.key
 
-# Demo audio files (too large for git; download via seed script)
-beatstream/demo/audio/*.mp3
+# Demo audio files tracked via Git LFS (see .gitattributes)
