@@ -256,6 +256,22 @@ services:
       - data
     restart: unless-stopped
 
+  opensearch:
+    image: opensearchproject/opensearch:2.12.0
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms256m -Xmx256m"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - data
+    restart: unless-stopped
+
   # ── Observability tier ───────────────────────────────────────────────────────
   # Prometheus scrapes metrics from API containers via the monitoring network.
   # Grafana and Jaeger are accessible from the host for dashboards/traces.
