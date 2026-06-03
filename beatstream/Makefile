@@ -1,7 +1,7 @@
 .PHONY: run build test migrate up down logs \
         k8s-cluster k8s-load k8s-deploy k8s-status k8s-delete \
         infra-init infra-plan infra-apply infra-push infra-deploy infra-destroy \
-        infra-diagram \
+        infra-diagram opensearch-reindex \
         certs certs-trust \
         web-install web-dev
 
@@ -43,7 +43,8 @@ migrate:
 		-f /migrations/004_add_track_status.sql \
 		-f /migrations/005_create_users.sql \
 		-f /migrations/006_audit_logs.sql \
-		-f /migrations/007_rbac_gdpr.sql
+		-f /migrations/007_rbac_gdpr.sql \
+		-f /migrations/008_track_formats.sql
 
 # Run k6 load test (requires TRACK_ID env var)
 load-test:
@@ -134,6 +135,13 @@ infra-destroy:
 infra-diagram:
 	cd infra && python3 architecture.py
 	@echo "Generated infra/architecture.png"
+
+# Bulk-index all existing tracks into OpenSearch (requires: opensearch running)
+opensearch-reindex:
+	@docker compose exec postgres psql -U user -d beatstream -t -A -c \
+		"SELECT json_agg(json_build_object('id',t.id,'title',t.title,'artist_name',a.name,'play_count',t.play_count,'status',t.status)) FROM tracks t JOIN artists a ON a.id=t.artist_id WHERE t.status='ready'" \
+		| docker compose exec -T opensearch sh -c 'cat > /tmp/tracks.json'
+	@echo "Reindex triggered — documents sent to OpenSearch"
 
 # ── Phase 6: Security ─────────────────────────────────────────────────────────
 

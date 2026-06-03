@@ -35,14 +35,21 @@ func NewTracks(db *pgxpool.Pool, store *storage.Storage, c *cache.Redis, p queue
 }
 
 type trackRow struct {
-	ID          string    `json:"id"`
-	Title       string    `json:"title"`
-	ArtistID    string    `json:"artist_id"`
-	DurationMs  int       `json:"duration_ms"`
-	ReleaseDate *string   `json:"release_date,omitempty"`
-	PlayCount   int64     `json:"play_count"`
-	Status      string    `json:"status"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID          string      `json:"id"`
+	Title       string      `json:"title"`
+	ArtistID    string      `json:"artist_id"`
+	DurationMs  int         `json:"duration_ms"`
+	ReleaseDate *string     `json:"release_date,omitempty"`
+	PlayCount   int64       `json:"play_count"`
+	Status      string      `json:"status"`
+	CreatedAt   time.Time   `json:"created_at"`
+	Formats     []formatRow `json:"formats,omitempty"`
+}
+
+type formatRow struct {
+	Bitrate   int    `json:"bitrate"`
+	Codec     string `json:"codec"`
+	SizeBytes int64  `json:"size_bytes"`
 }
 
 func (h *Tracks) List(c *gin.Context) {
@@ -96,6 +103,19 @@ func (h *Tracks) Get(c *gin.Context) {
 		return
 	}
 
+	// Fetch available bitrate formats for this track.
+	fmtRows, err := h.db.Query(c.Request.Context(),
+		`SELECT bitrate, codec, size_bytes FROM track_formats WHERE track_id = $1 ORDER BY bitrate`, id)
+	if err == nil {
+		defer fmtRows.Close()
+		for fmtRows.Next() {
+			var f formatRow
+			if err := fmtRows.Scan(&f.Bitrate, &f.Codec, &f.SizeBytes); err == nil {
+				t.Formats = append(t.Formats, f)
+			}
+		}
+	}
+
 	// Only cache ready tracks — pending/processing status changes and must not be frozen in cache.
 	if t.Status == "ready" {
 		if data, err := json.Marshal(t); err == nil {
@@ -107,13 +127,21 @@ func (h *Tracks) Get(c *gin.Context) {
 
 func (h *Tracks) Stream(c *gin.Context) {
 	id := c.Param("id")
+	quality := c.DefaultQuery("quality", "128")
 
+	// Try adaptive bitrate: look up the requested quality in track_formats.
 	var audioKey string
 	err := h.db.QueryRow(c.Request.Context(),
-		`SELECT audio_key FROM tracks WHERE id = $1`, id).Scan(&audioKey)
+		`SELECT s3_key FROM track_formats WHERE track_id = $1 AND bitrate = $2`,
+		id, quality).Scan(&audioKey)
 	if err != nil {
-		c.JSON(http.StatusNotFound, apiError("track not found"))
-		return
+		// Fallback to original audio_key for legacy tracks without transcoded formats.
+		err = h.db.QueryRow(c.Request.Context(),
+			`SELECT audio_key FROM tracks WHERE id = $1`, id).Scan(&audioKey)
+		if err != nil {
+			c.JSON(http.StatusNotFound, apiError("track not found"))
+			return
+		}
 	}
 
 	// Publish play event to Redpanda; analytics worker persists it asynchronously.

@@ -106,6 +106,18 @@ func (s *Storage) Upload(ctx context.Context, key string, r io.Reader, size int6
 	return err
 }
 
+// Download retrieves an object from S3 and returns its body as an io.ReadCloser.
+func (s *Storage) Download(ctx context.Context, key string) (io.ReadCloser, error) {
+	out, err := s.uploadClient.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get object %s: %w", key, err)
+	}
+	return out.Body, nil
+}
+
 // PresignedURL returns a time-limited URL for direct client download.
 func (s *Storage) PresignedURL(ctx context.Context, key string, ttl time.Duration) (*url.URL, error) {
 	req, err := s.presignClient.PresignGetObject(ctx, &s3.GetObjectInput{

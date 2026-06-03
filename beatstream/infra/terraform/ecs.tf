@@ -102,8 +102,8 @@ resource "aws_ecs_task_definition" "worker" {
   family                   = "beatstream-worker"
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
-  cpu                      = 256 # 0.25 vCPU — transcoding is simulated, not real
-  memory                   = 512
+  cpu                      = 1024 # 1 vCPU — real ffmpeg transcoding needs compute headroom
+  memory                   = 2048
   execution_role_arn       = aws_iam_role.ecs_execution.arn
   task_role_arn            = aws_iam_role.ecs_task.arn
 

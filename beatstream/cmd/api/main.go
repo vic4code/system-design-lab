@@ -19,6 +19,7 @@ import (
 	applogger "github.com/vic4code/system-design-lab/beatstream/internal/logger"
 	"github.com/vic4code/system-design-lab/beatstream/internal/middleware"
 	"github.com/vic4code/system-design-lab/beatstream/internal/queue"
+	"github.com/vic4code/system-design-lab/beatstream/internal/search"
 	"github.com/vic4code/system-design-lab/beatstream/internal/storage"
 	"github.com/vic4code/system-design-lab/beatstream/internal/telemetry"
 )
@@ -143,13 +144,28 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"status": "ready"})
 	})
 
+	// ── OpenSearch (optional) ──────────────────────────────────────────────────
+	// OPENSEARCH_URL: http://opensearch:9200 (local) or VPC endpoint (AWS)
+	// When available, search uses fuzzy multi-field matching instead of tsvector.
+	var osClient *search.Client
+	if osURL := os.Getenv("OPENSEARCH_URL"); osURL != "" {
+		osClient = search.New(osURL)
+		if err := osClient.EnsureIndex(ctx); err != nil {
+			log.Warn("OpenSearch index setup failed — falling back to PostgreSQL", zap.Error(err))
+			osClient = nil
+		} else {
+			log.Info("OpenSearch connected", zap.String("endpoint", osURL))
+		}
+	}
+
 	jwtSecret := getEnv("JWT_SECRET", "dev-secret-change-in-production")
 
 	auth := handler.NewAuth(pool, jwtSecret)
 	artists := handler.NewArtists(pool)
 	tracks := handler.NewTracks(pool, store, rdb, producer)
 	playlists := handler.NewPlaylists(pool)
-	search := handler.NewSearch(pool, rdb)
+	searchHandler := handler.NewSearch(pool, rdb, osClient)
+	recs := handler.NewRecommendations(pool, rdb)
 	admin := handler.NewAdmin(pool)
 
 	requireAuth := middleware.RequireAuth(jwtSecret)
@@ -199,7 +215,13 @@ func main() {
 		v1.POST("/playlists/:id/tracks", requireAuth, playlists.AddTrack)
 		v1.DELETE("/playlists/:id/tracks/:track_id", requireAuth, playlists.RemoveTrack)
 
-		v1.GET("/search", search.Search)
+		v1.GET("/search", searchHandler.Search)
+		v1.GET("/search/autocomplete", searchHandler.Autocomplete)
+
+		// Recommendations
+		v1.GET("/recommendations/top", recs.TopTracks)
+		v1.GET("/recommendations/for-you", requireAuth, recs.ForYou)
+		v1.GET("/tracks/:id/similar", recs.Similar)
 	}
 
 	port := getEnv("PORT", "8080")

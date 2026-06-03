@@ -9,15 +9,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vic4code/system-design-lab/beatstream/internal/cache"
 	"github.com/vic4code/system-design-lab/beatstream/internal/metrics"
+	"github.com/vic4code/system-design-lab/beatstream/internal/search"
 )
 
 type Search struct {
 	db    *pgxpool.Pool
 	cache *cache.Redis
+	os    *search.Client
 }
 
-func NewSearch(db *pgxpool.Pool, c *cache.Redis) *Search {
-	return &Search{db: db, cache: c}
+func NewSearch(db *pgxpool.Pool, c *cache.Redis, os *search.Client) *Search {
+	return &Search{db: db, cache: c, os: os}
 }
 
 type searchResponse struct {
@@ -32,7 +34,6 @@ func (h *Search) Search(c *gin.Context) {
 		return
 	}
 
-	// Return cached search results if available (1min TTL — balances freshness vs. DB load).
 	cacheKey := "search:" + q
 	if cached, err := h.cache.Get(c.Request.Context(), cacheKey); err == nil {
 		var resp searchResponse
@@ -44,8 +45,30 @@ func (h *Search) Search(c *gin.Context) {
 	}
 	metrics.CacheMisses.WithLabelValues("search").Inc()
 
-	// Full-text search using PostgreSQL tsvector, ranked by play_count.
-	// ts_rank weights recent plays more — play_count DESC is the tiebreaker.
+	// If OpenSearch is available, use fuzzy multi-field search.
+	if h.os != nil {
+		results, err := h.os.Search(c.Request.Context(), q, 20)
+		if err == nil {
+			resp := searchResponse{
+				Items: make([]trackRow, 0, len(results)),
+				Total: len(results),
+			}
+			for _, r := range results {
+				resp.Items = append(resp.Items, trackRow{
+					ID:       r.ID,
+					Title:    r.Title,
+					ArtistID: r.ArtistName,
+				})
+			}
+			if data, err := json.Marshal(resp); err == nil {
+				h.cache.Set(c.Request.Context(), cacheKey, string(data), time.Minute)
+			}
+			c.JSON(http.StatusOK, resp)
+			return
+		}
+		// OpenSearch failed — fall through to PostgreSQL tsvector.
+	}
+
 	rows, err := h.db.Query(c.Request.Context(), `
 		SELECT id, title, artist_id, duration_ms, release_date::TEXT, play_count, created_at
 		FROM tracks
@@ -80,7 +103,30 @@ func (h *Search) Search(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-// apiError is a shared helper for structured JSON error responses.
 func apiError(msg string) gin.H {
 	return gin.H{"error": msg}
+}
+
+func (h *Search) Autocomplete(c *gin.Context) {
+	q := c.Query("q")
+	if q == "" {
+		c.JSON(http.StatusBadRequest, apiError("q parameter is required"))
+		return
+	}
+
+	if h.os == nil {
+		c.JSON(http.StatusServiceUnavailable, apiError("autocomplete requires OpenSearch"))
+		return
+	}
+
+	suggestions, err := h.os.Autocomplete(c.Request.Context(), q, 5)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, apiError("autocomplete failed"))
+		return
+	}
+	if suggestions == nil {
+		suggestions = []string{}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"suggestions": suggestions})
 }
