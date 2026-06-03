@@ -93,6 +93,25 @@ resource "aws_security_group" "redis" {
   }
 }
 
+# OpenSearch: HTTPS only, accessible from API and Worker tasks.
+resource "aws_security_group" "opensearch" {
+  name   = "beatstream-opensearch"
+  vpc_id = aws_vpc.main.id
+
+  ingress {
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = [aws_security_group.api.id, aws_security_group.worker.id]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
 # MSK: port 9098 = IAM auth (SASL/OAUTHBEARER over TLS).
 resource "aws_security_group" "msk" {
   name   = "beatstream-msk"

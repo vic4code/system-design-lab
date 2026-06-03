@@ -12,6 +12,6 @@ EXPOSE 8080 9090
 CMD ["/beatstream-api"]
 
 FROM alpine:3.19 AS worker
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates ffmpeg
 COPY --from=builder /app/beatstream-worker /beatstream-worker
 CMD ["/beatstream-worker"]

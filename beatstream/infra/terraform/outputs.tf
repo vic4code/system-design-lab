@@ -37,3 +37,8 @@ output "audio_bucket" {
   description = "S3 bucket name for audio files."
   value       = aws_s3_bucket.audio.bucket
 }
+
+output "opensearch_endpoint" {
+  description = "OpenSearch domain endpoint for search queries."
+  value       = "https://${aws_opensearch_domain.main.endpoint}"
+}

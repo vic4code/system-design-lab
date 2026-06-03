@@ -40,6 +40,7 @@ services:
       S3_SECRET_KEY: minioadmin
       S3_BUCKET: beatstream-audio
       KAFKA_BROKERS: redpanda:9092
+      OPENSEARCH_URL: http://opensearch:9200
       PORT: "8080"
       METRICS_PORT: "9090"
       LOG_FORMAT: "json"
@@ -77,6 +78,7 @@ services:
       S3_SECRET_KEY: minioadmin
       S3_BUCKET: beatstream-audio
       KAFKA_BROKERS: redpanda:9092
+      OPENSEARCH_URL: http://opensearch:9200
       PORT: "8080"
       METRICS_PORT: "9090"
       LOG_FORMAT: "json"
@@ -111,6 +113,7 @@ services:
       S3_SECRET_KEY: minioadmin
       S3_BUCKET: beatstream-audio
       KAFKA_BROKERS: redpanda:9092
+      OPENSEARCH_URL: http://opensearch:9200
       PORT: "8080"
       METRICS_PORT: "9090"
       LOG_FORMAT: "json"
@@ -142,13 +145,20 @@ services:
     environment:
       DATABASE_URL: postgres://user:pass@postgres:5432/beatstream?sslmode=disable
       KAFKA_BROKERS: redpanda:9092
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_BUCKET: beatstream-audio
+      OPENSEARCH_URL: http://opensearch:9200
     depends_on:
       postgres:
         condition: service_healthy
       redpanda:
         condition: service_healthy
+      minio:
+        condition: service_started
     networks:
-      - data  # needs postgres + redpanda; cannot be reached from app or public
+      - data  # needs postgres + redpanda + minio; cannot be reached from app or public
     restart: unless-stopped
 
   # ── Data tier ────────────────────────────────────────────────────────────────
@@ -228,6 +238,22 @@ services:
     # Port 9000 (S3 API) intentionally not exposed to host.
     # Pre-signed URLs use localhost:9000 only because S3_PRESIGN_ENDPOINT=http://localhost:9000;
     # in production this points to CloudFront/S3 directly.
+    networks:
+      - data
+    restart: unless-stopped
+
+  opensearch:
+    image: opensearchproject/opensearch:2.12.0
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms256m -Xmx256m"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
     networks:
       - data
     restart: unless-stopped
