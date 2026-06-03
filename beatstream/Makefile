@@ -2,6 +2,7 @@
         k8s-cluster k8s-load k8s-deploy k8s-status k8s-delete \
         infra-init infra-plan infra-apply infra-push infra-deploy infra-destroy \
         infra-diagram opensearch-reindex \
+        seed seed-demo \
         certs certs-trust \
         web-install web-dev
 
@@ -50,9 +51,13 @@ migrate:
 load-test:
 	k6 run k6/load.js
 
-# Seed sample data
+# Seed sample data (SQL — artists + tracks metadata only)
 seed:
 	docker compose exec postgres psql -U user -d beatstream -f /migrations/seed.sql
+
+# Seed demo audio tracks via API (uploads 20 CC-licensed songs, triggers transcoding)
+seed-demo:
+	cd demo && ./seed-demo-tracks.sh
 
 # Format Go code
 fmt:
